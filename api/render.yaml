@@ -2,9 +2,11 @@ services:
   - type: web
     name: medical-ai
     env: python
-    buildCommand: ""
-    startCommand: gunicorn app:app
+    rootDir: api
+    plan: free
     autoDeploy: true
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn -w 2 -k gthread -b 0.0.0.0:$PORT app:app"
     envVars:
       - key: OPENAI_API_KEY
         sync: false
@@ -17,4 +19,8 @@ services:
       - key: DB_PASS
         sync: false
       - key: DB_PORT
-        sync: false
+        value: "3306"          # set here or via dashboard
+      - key: SECRET_KEY
+        sync: false            # add in dashboard
+      - key: MAX_ANALYZE_IMAGES
+        value: "8"

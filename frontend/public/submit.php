@@ -9,7 +9,8 @@ if (!isset($_SESSION['doctor_id'])) {
 }
 
 // ---------- CONFIG ----------
-$FLASK_BASE = "http://localhost:5000"; // change if Flask runs elsewhere
+//$FLASK_BASE = "http://localhost:5000"; // change if Flask runs elsewhere
+$FLASK_BASE = getenv('API_BASE_URL') ?: 'http://localhost:5000';
 
 // ---------- HELPERS ----------
 function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }

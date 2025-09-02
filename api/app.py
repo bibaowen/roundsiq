@@ -1,3 +1,4 @@
+from __future__ import annotations
 from flask import Flask, request, jsonify, render_template_string
 from dotenv import load_dotenv
 import os, io, base64, json, traceback, threading, time
@@ -6,7 +7,6 @@ from mysql.connector import Error
 from pathlib import Path
 from openai import OpenAI
 import httpx
-from flask import Flask, request, jsonify, render_template_string
 # NEW
 from flask_cors import CORS
 
@@ -17,18 +17,52 @@ if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing. Set it in .env or environment variables.")
 
 # ---------- Image handling dependencies ----------
-try:
-    from PIL import Image
-    HAVE_PIL = True
-except Exception:
-    HAVE_PIL = False
+# try:
+#     from PIL import Image
+#     HAVE_PIL = True
+# except Exception:
+#     HAVE_PIL = False
 
-try:
-    import pydicom
-    import numpy as np
-    HAVE_DICOM = True
-except Exception:
-    HAVE_DICOM = False
+# try:
+#     import pydicom
+#     import numpy as np
+#     HAVE_DICOM = True
+# except Exception:
+#     HAVE_DICOM = False
+ALLOWED_EXT = {'png', 'jpg', 'jpeg', 'webp', 'bmp', 'tif', 'tiff', 'dcm', 'dicom'}
+MAX_IMAGES = int(os.getenv("MAX_ANALYZE_IMAGES", "8"))
+
+def file_ok(filename: str) -> bool:
+    return bool(filename and '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXT)
+
+# (annotation no longer mentions Image directly; __future__ also protects you)
+def pil_to_png_bytes(img) -> bytes:
+    buf = io.BytesIO()
+    img.convert('RGB').save(buf, format='PNG')
+    return buf.getvalue()
+
+def image_file_to_png_bytes(fstorage) -> tuple[bytes, str]:
+    fname = fstorage.filename or "upload"
+    ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
+    raw = fstorage.read()
+
+    if ext in ('dcm', 'dicom'):
+        if not HAVE_DICOM:
+            raise RuntimeError("DICOM support not available on server")
+        ds = pydicom.dcmread(io.BytesIO(raw))
+        arr = ds.pixel_array.astype('float32')
+        arr = 255*(arr - arr.min()) / max(1e-6, (arr.max() - arr.min()))
+        arr = arr.astype('uint8')
+        if not HAVE_PIL or PILImage is None:
+            raise RuntimeError("Pillow not available to encode PNG")
+        im = PILImage.fromarray(arr, mode='L')
+        return pil_to_png_bytes(im), "dicom"
+
+    if not HAVE_PIL or PILImage is None:
+        raise RuntimeError("Pillow not available on server")
+    im = PILImage.open(io.BytesIO(raw))
+    return pil_to_png_bytes(im), "image"
+
 
 # ---------- OpenAI client ----------
 proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")

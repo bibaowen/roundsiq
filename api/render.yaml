@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: medical-ai
+    name: roundsiq
     env: python
     rootDir: api
     plan: free
@@ -11,8 +11,8 @@ services:
       pip install --no-cache-dir -r requirements.txt
     startCommand: "gunicorn -w 2 -k gthread -b 0.0.0.0:$PORT app:app"
     envVars:
-       - key: PYTHON_VERSION
-         value: 3.11.9
+      - key: PYTHON_VERSION
+        value: 3.11.9
       - key: OPENAI_API_KEY
         sync: false
       - key: DB_HOST
@@ -24,8 +24,8 @@ services:
       - key: DB_PASS
         sync: false
       - key: DB_PORT
-        value: "3306"          # set here or via dashboard
+        value: "3306"
       - key: SECRET_KEY
-        sync: false            # add in dashboard
+        sync: false
       - key: MAX_ANALYZE_IMAGES
         value: "8"

@@ -1,16 +1,23 @@
 <?php
 session_start();
 ini_set('max_execution_time', 300); // still useful for large uploads
-require_once "db.php";
+session_start();
+ini_set('max_execution_time', 300);
+require_once __DIR__ . '/config.php'; // gives $pdo and $API_BASE_URL
 
 if (!isset($_SESSION['doctor_id'])) {
     header("Location: login.php");
     exit;
 }
 
-// ---------- CONFIG ----------
-//$FLASK_BASE = "http://localhost:5000"; // change if Flask runs elsewhere
-$FLASK_BASE = getenv('API_BASE_URL') ?: 'http://localhost:5000';
+$FLASK_BASE = $API_BASE_URL ?: 'http://localhost:5000';
+
+
+if (!isset($_SESSION['doctor_id'])) {
+    header("Location: login.php");
+    exit;
+}
+
 
 // ---------- HELPERS ----------
 function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }

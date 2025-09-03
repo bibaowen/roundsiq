@@ -192,7 +192,6 @@ def get_prompt_modifier(specialty_slug: str) -> str:
         return ""
 
 # ---------- Image helpers ----------
-# ---------- Image helpers ----------
 ALLOWED_EXT = {'png', 'jpg', 'jpeg', 'webp', 'bmp', 'tif', 'tiff', 'dcm', 'dicom'}
 MAX_IMAGES = int(os.getenv("MAX_ANALYZE_IMAGES", "8"))
 
@@ -227,6 +226,7 @@ def image_file_to_png_bytes(fstorage) -> tuple[bytes, str]:
         raise RuntimeError("Pillow not available on server")
     im = PILImage.open(io.BytesIO(raw))
     return pil_to_png_bytes(im), "image"
+
 
 
 # ---------- Core measure guidance mapping ----------

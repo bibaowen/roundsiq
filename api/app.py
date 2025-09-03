@@ -427,6 +427,7 @@ def queue_analysis():
             data = request.get_json(silent=True) or {}
             note = (data.get("note") or "").strip()
             specialty = data.get("specialty", "general")
+            doctor_id = data.get("doctor_id")  # may be None
 
         if not note:
             return jsonify({"error": "Missing clinical note"}), 400
@@ -437,9 +438,9 @@ def queue_analysis():
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO clinical_analyses (patient_name, specialty, note, status, images_json, created_at)
-            VALUES (%s, %s, %s, 'pending', %s, CURRENT_TIMESTAMP)
-        """, (patient_name, specialty, note, json.dumps(images_data_uris or [])))
+            INSERT INTO clinical_analyses (doctor_id, patient_name, specialty, note, status, images_json, created_at)
+            VALUES (%s, %s, %s, %s, 'pending', %s, CURRENT_TIMESTAMP)
+        """, (doctor_id, patient_name, specialty, note, json.dumps(images_data_uris or [])))
         analysis_id = cursor.lastrowid
         conn.commit()
         cursor.close(); conn.close()

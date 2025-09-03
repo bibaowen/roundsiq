@@ -338,7 +338,7 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
 # ---------- Routes ----------
 @app.route('/')
 def home():
-    return "✅ Medical AI API with history & comparison dashboard (MySQL) is running."
+    return "✅ RoundsIQ with history & comparison dashboard (MySQL) is running."
 
 # ---- Synchronous (legacy) ----
 @app.route('/analyze', methods=['POST'])

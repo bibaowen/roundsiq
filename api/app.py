@@ -16,8 +16,8 @@ if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing. Set it in .env or environment variables.")
 
 # Models / token budgets
-FAST_MODEL = os.getenv("FAST_MODEL", "gpt-4o-mini")  # fast lane model (short outputs)
-FULL_MODEL = os.getenv("FULL_MODEL", "gpt-5")        # detailed write-up model
+FAST_MODEL = os.getenv("FAST_MODEL", "gpt-4o-mini")   # fast pass (short JSON)
+FULL_MODEL = os.getenv("FULL_MODEL", "gpt-5")         # full pass (rich 10-section)
 FULL_MAX_TOKENS = int(os.getenv("FULL_MAX_TOKENS", "3000"))
 
 # ---------- Image handling dependencies ----------
@@ -120,7 +120,7 @@ def ensure_columns():
             if cur.fetchone()[0] == 0:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
-        # Columns our code relies on
+        # Columns used by code
         add_col('clinical_analyses', 'doctor_id',           "doctor_id INT UNSIGNED NULL")
         add_col('clinical_analyses', 'status',              "status VARCHAR(20) NOT NULL DEFAULT 'completed'")
         add_col('clinical_analyses', 'images_json',         "images_json JSON NULL")
@@ -128,7 +128,7 @@ def ensure_columns():
         add_col('clinical_analyses', 'updated_at',          "updated_at TIMESTAMP NULL DEFAULT NULL")
         add_col('clinical_analyses', 'error_message',       "error_message TEXT NULL")
         add_col('clinical_analyses', 'mode',                "mode VARCHAR(10) NOT NULL DEFAULT 'full'")
-        add_col('clinical_analyses', 'upgrade_to_id',       "upgrade_to_id INT UNSIGNED NULL")
+        # (we no longer need upgrade_to_id; safe to leave if it exists)
 
         # Composite index on (status, created_at)
         cur.execute("""
@@ -137,21 +137,12 @@ def ensure_columns():
               AND TABLE_NAME='clinical_analyses'
               AND INDEX_NAME='idx_status_created'
         """)
-        name_exists = (cur.fetchone()[0] > 0)
-
-        if not name_exists:
+        if cur.fetchone()[0] == 0:
             try:
                 cur.execute("ALTER TABLE clinical_analyses ADD INDEX idx_status_created (status, created_at)")
             except mysql.connector.Error as e:
                 if e.errno != 1061:
                     raise
-
-        # Index for upgrade follow-ups
-        try:
-            cur.execute("CREATE INDEX idx_upgrade_to ON clinical_analyses (upgrade_to_id)")
-        except mysql.connector.Error as e:
-            if e.errno != 1061:
-                raise
 
         conn.commit()
     except Exception as e:
@@ -192,7 +183,6 @@ def image_file_to_png_bytes(fstorage) -> tuple[bytes, str]:
     ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
     raw = fstorage.read()
 
-    # DICOM → PNG
     if ext in ('dcm', 'dicom'):
         if not HAVE_DICOM:
             raise RuntimeError("DICOM support not available on server")
@@ -205,7 +195,6 @@ def image_file_to_png_bytes(fstorage) -> tuple[bytes, str]:
         im = PILImage.fromarray(arr, mode='L')
         return pil_to_png_bytes(im), "dicom"
 
-    # Standard image → PNG
     if not HAVE_PIL or PILImage is None:
         raise RuntimeError("Pillow not available on server")
     im = PILImage.open(io.BytesIO(raw))
@@ -244,7 +233,7 @@ def build_prompt(note: str, specialty: str, images_meta_text: str, detected_cond
         for cond in detected_conditions
     )
     prompt_text = f"""You are a highly trained clinical decision support AI.
-Analyze the clinical case below and return structured diagnostic reasoning using these 10 sections:
+Return a detailed, structured report with EXACTLY these 10 numbered sections and headings, in this order, with substantive content under each:
 
 1. Differential Diagnosis
 2. Pathophysiology Integration
@@ -256,6 +245,8 @@ Analyze the clinical case below and return structured diagnostic reasoning using
 8. Disposition & Follow-Up
 9. Red Flags or Missed Diagnoses
 10. Clinical Guidelines Integration
+
+Each section must contain clinically specific recommendations (drug names, doses, routes, frequencies when relevant), and cite widely used guideline sources inline (short parenthetical, e.g., AHA/ACC 2022). Do NOT output JSON.
 
 {modifier}
 
@@ -289,7 +280,7 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
     for uri in images_data_uris:
         content_blocks.append({"type": "image_url", "image_url": {"url": uri}})
 
-    # Use FULL client with long timeouts + generous token budget
+    # FULL client with long timeout + generous token budget
     resp = full_client.chat.completions.create(
         model=FULL_MODEL,
         messages=[
@@ -338,7 +329,6 @@ def analyze():
         note = ''
         specialty = 'general'
 
-        # Handle form-data or JSON
         if request.files:
             note = (request.form.get("note") or "").strip()
             specialty = request.form.get("specialty", "general")
@@ -361,10 +351,8 @@ def analyze():
 
         patient_name = note.split(",")[0].strip() if "," in note else "Unknown"
 
-        # Run FULL (blocking)
         analysis, detected = run_gpt5_analysis(note, specialty, images_data_uris, filenames_meta)
 
-        # Save to DB
         try:
             conn = get_connection()
             cursor = conn.cursor()
@@ -374,10 +362,8 @@ def analyze():
             """, (patient_name, specialty, note, analysis, json.dumps(images_data_uris or []), json.dumps(detected)))
             conn.commit()
         finally:
-            try:
-                cursor.close(); conn.close()
-            except:
-                pass
+            try: cursor.close(); conn.close()
+            except: pass
 
         return jsonify({
             "full_response": analysis,
@@ -392,10 +378,6 @@ def analyze():
 # ---- Async queue endpoint ----
 @app.route('/queue_analysis', methods=['POST'])
 def queue_analysis():
-    """
-    Accepts JSON or multipart (note, specialty, optional images[]).
-    Stores a pending job so the worker can process it in background.
-    """
     try:
         images_data_uris, filenames_meta = [], []
         note = ''
@@ -460,7 +442,7 @@ def get_analysis():
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
             SELECT id, patient_name, specialty, note, analysis, status, images_json,
-                   detected_conditions, mode, upgrade_to_id, created_at, updated_at
+                   detected_conditions, mode, created_at, updated_at
             FROM clinical_analyses WHERE id = %s
         """, (analysis_id,))
         record = cursor.fetchone()
@@ -468,7 +450,6 @@ def get_analysis():
         if not record:
             return jsonify({"error": "Analysis not found"}), 404
 
-        # decode JSON columns for neatness
         try:
             record["images_json"] = json.loads(record["images_json"]) if record["images_json"] else []
         except Exception:
@@ -492,12 +473,10 @@ def process_pending_jobs():
                 print("[worker] heartbeat OK")
                 last_beat = time.time()
 
-            # --- claim one job atomically ---
             conn = get_connection()
-            conn.start_transaction()  # explicit TX
+            conn.start_transaction()
             cursor = conn.cursor(dictionary=True)
 
-            # Prefer SKIP LOCKED on MySQL 8.0+
             try:
                 cursor.execute("""
                     SELECT id, doctor_id, patient_name, specialty, note, images_json, mode
@@ -508,7 +487,6 @@ def process_pending_jobs():
                     FOR UPDATE SKIP LOCKED
                 """)
             except mysql.connector.errors.ProgrammingError:
-                # Fallback (no SKIP LOCKED)
                 cursor.execute("""
                     SELECT id, doctor_id, patient_name, specialty, note, images_json, mode
                     FROM clinical_analyses
@@ -529,12 +507,11 @@ def process_pending_jobs():
             cursor.close(); conn.close()
 
             if not job:
-                time.sleep(0.25)  # light idle
+                time.sleep(0.25)
                 continue
 
             print(f"[worker] Processing analysis {job['id']} (mode={job.get('mode','full')})...")
 
-            # --- do the work ---
             try:
                 images_data_uris = []
                 try:
@@ -546,40 +523,26 @@ def process_pending_jobs():
                 mode = (job.get('mode') or 'full').lower()
 
                 if mode == 'fast':
-                    # 1) Fast triage
-                    analysis_result = run_fast_analysis(job['note'], job['specialty'])
-                    detected = []  # skip heavy detection for fast pass
+                    # FAST triage first
+                    fast_result = run_fast_analysis(job['note'], job['specialty'])
 
-                    # 2) Enqueue FULL follow-up job
+                    # Save FAST result to the SAME ROW (intermediate state)
                     conn = get_connection()
                     cursor = conn.cursor()
-                    cursor.execute("""
-                        INSERT INTO clinical_analyses
-                            (doctor_id, patient_name, specialty, note, status, images_json, mode, created_at)
-                        VALUES
-                            (%s, %s, %s, %s, 'pending', %s, 'full', CURRENT_TIMESTAMP)
-                    """, (job.get('doctor_id'), job['patient_name'], job['specialty'],
-                          job['note'], json.dumps(images_data_uris or [])))
-                    full_id = cursor.lastrowid
-
-                    # 3) Save fast result & pointer to upgrade
                     cursor.execute("""
                         UPDATE clinical_analyses
                         SET analysis = %s,
                             status = 'completed_fast',
-                            detected_conditions = %s,
-                            upgrade_to_id = %s,
                             updated_at = CURRENT_TIMESTAMP,
                             error_message = NULL
                         WHERE id = %s
-                    """, (analysis_result, json.dumps(detected), full_id, job['id']))
+                    """, (fast_result, job['id']))
                     conn.commit()
                     cursor.close(); conn.close()
-                    print(f"[worker] Fast pass completed for {job['id']} → full job {full_id}")
+                    print(f"[worker] Fast pass saved for {job['id']} (status=completed_fast)")
 
-                else:
-                    # FULL analysis (long timeout + big token budget)
-                    analysis_result, detected = run_gpt5_analysis(
+                    # Immediately upgrade to FULL on the SAME ROW
+                    full_result, detected = run_gpt5_analysis(
                         note=job['note'],
                         specialty=job['specialty'],
                         images_data_uris=images_data_uris,
@@ -595,7 +558,30 @@ def process_pending_jobs():
                             updated_at = CURRENT_TIMESTAMP,
                             error_message = NULL
                         WHERE id = %s
-                    """, (analysis_result, json.dumps(detected), job['id']))
+                    """, (full_result, json.dumps(detected), job['id']))
+                    conn.commit()
+                    cursor.close(); conn.close()
+                    print(f"[worker] Full upgrade completed for {job['id']}")
+
+                else:
+                    # FULL analysis only
+                    full_result, detected = run_gpt5_analysis(
+                        note=job['note'],
+                        specialty=job['specialty'],
+                        images_data_uris=images_data_uris,
+                        filenames_meta=filenames_meta
+                    )
+                    conn = get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE clinical_analyses
+                        SET analysis = %s,
+                            status = 'completed',
+                            detected_conditions = %s,
+                            updated_at = CURRENT_TIMESTAMP,
+                            error_message = NULL
+                        WHERE id = %s
+                    """, (full_result, json.dumps(detected), job['id']))
                     conn.commit()
                     cursor.close(); conn.close()
                     print(f"[worker] Full analysis completed for {job['id']}")
@@ -624,82 +610,4 @@ def process_pending_jobs():
 
 @app.route('/health')
 def health():
-    return jsonify({"ok": True})
-
-# Start worker thread
-threading.Thread(target=process_pending_jobs, daemon=True).start()
-
-# ---------- History / Compare ----------
-@app.route('/history', methods=['GET'])
-def history():
-    patient_name = request.args.get("patient_name", "").strip()
-    if not patient_name:
-        return jsonify({"error": "Missing patient_name"}), 400
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT id, patient_name, specialty, created_at, status
-            FROM clinical_analyses
-            WHERE patient_name = %s
-            ORDER BY created_at DESC
-        """, (patient_name,))
-        rows = cursor.fetchall()
-        cursor.close(); conn.close()
-        return jsonify([
-            {
-                "id": r["id"],
-                "patient_name": r["patient_name"],
-                "specialty": r["specialty"],
-                "status": r.get("status", "completed"),
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None
-            } for r in rows
-        ])
-    except Exception as e:
-        return jsonify({"error": f"DB error: {str(e)}"}), 500
-
-@app.route('/worker_stats')
-def worker_stats():
-    try:
-        conn = get_connection()
-        cur = conn.cursor(dictionary=True)
-        cur.execute("SELECT COUNT(*) AS c FROM clinical_analyses WHERE status='pending'")
-        pending = cur.fetchone()['c']
-        cur.execute("SELECT COUNT(*) AS c FROM clinical_analyses WHERE status='processing'")
-        processing = cur.fetchone()['c']
-        cur.execute("SELECT COUNT(*) AS c FROM clinical_analyses WHERE status='failed'")
-        failed = cur.fetchone()['c']
-        cur.close(); conn.close()
-        return jsonify({"pending": pending, "processing": processing, "failed": failed})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/compare', methods=['GET'])
-def compare():
-    id1 = request.args.get("id1")
-    id2 = request.args.get("id2")
-    render = request.args.get("render", "html")
-    if not id1 or not id2:
-        return jsonify({"error": "Missing id1 or id2"}), 400
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""SELECT id, patient_name, specialty, note, analysis, created_at
-                          FROM clinical_analyses WHERE id = %s""", (id1,))
-        record1 = cursor.fetchone()
-        cursor.execute("""SELECT id, patient_name, specialty, note, analysis, created_at
-                          FROM clinical_analyses WHERE id = %s""", (id2,))
-        record2 = cursor.fetchone()
-        cursor.close(); conn.close()
-        if not record1 or not record2:
-            return jsonify({"error": "One or both records not found"}), 404
-        if render == "json":
-            return jsonify({"comparison": [record1, record2]})
-        else:
-            return render_template_string(HTML_TEMPLATE, record1=record1, record2=record2)
-    except Exception as e:
-        return jsonify({"error": f"DB compare error: {str(e)}"}), 500
-
-if __name__ == '__main__':
-    threading.Thread(target=process_pending_jobs, daemon=True).start()
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False, threaded=True)
+    return jsonify({"ok

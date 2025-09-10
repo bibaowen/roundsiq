@@ -15,7 +15,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing. Set it in .env or environment variables.")
 
-FAST_MODEL = os.getenv("FAST_MODEL", "gpt-4.5")  # fast lane model
+FAST_MODEL = os.getenv("FAST_MODEL", "gpt-5")  # fast lane model
 
 # ---------- Image handling dependencies ----------
 try:

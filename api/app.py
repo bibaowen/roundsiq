@@ -7,7 +7,6 @@ from mysql.connector import Error
 from pathlib import Path
 from openai import OpenAI
 import httpx
-# NEW
 from flask_cors import CORS
 
 # ---------- Load environment variables ----------
@@ -15,6 +14,8 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing. Set it in .env or environment variables.")
+
+FAST_MODEL = os.getenv("FAST_MODEL", "gpt-4o-mini")  # fast lane model
 
 # ---------- Image handling dependencies ----------
 try:
@@ -31,13 +32,14 @@ try:
 except Exception:
     HAVE_DICOM = False
 
-# ---------- OpenAI client ----------
+# ---------- OpenAI client with faster-fail timeouts ----------
+client_timeout = httpx.Timeout(20.0, read=30.0, write=20.0, connect=10.0)
 proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
 if proxy:
-    client = OpenAI(api_key=OPENAI_API_KEY,
-                    http_client=httpx.Client(proxies=proxy, timeout=60))
+    http_client = httpx.Client(proxies=proxy, timeout=client_timeout)
 else:
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    http_client = httpx.Client(timeout=client_timeout)
+client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
 # ---------- Database settings ----------
 DB_HOST = os.getenv("DB_HOST")
@@ -46,17 +48,11 @@ DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 DB_PORT = int(os.getenv("DB_PORT", 3306))
 
-
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "default_secret_key")
 
 # NEW — allow your web app to call Flask from another origin/port
-CORS(
-    app,
-    resources={r"/*": {"origins": "*"}},
-    supports_credentials=False,
-)
-
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -105,7 +101,7 @@ def get_connection():
     )
 
 def ensure_columns():
-    """Idempotently add the async columns and composite index used by the worker."""
+    """Idempotently add columns / indexes the worker relies on."""
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -119,13 +115,15 @@ def ensure_columns():
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
         # Columns our code relies on
-        add_col('clinical_analyses', 'status',              "status VARCHAR(20) NOT NULL DEFAULT 'completed'")
-        add_col('clinical_analyses', 'images_json',         "images_json JSON NULL")
-        add_col('clinical_analyses', 'detected_conditions', "detected_conditions JSON NULL")
-        add_col('clinical_analyses', 'updated_at',          "updated_at TIMESTAMP NULL DEFAULT NULL")
-        add_col('clinical_analyses', 'error_message',       "error_message TEXT NULL")
+        add_col('clinical_analyses', 'doctor_id',          "doctor_id INT UNSIGNED NULL")
+        add_col('clinical_analyses', 'status',             "status VARCHAR(20) NOT NULL DEFAULT 'completed'")
+        add_col('clinical_analyses', 'images_json',        "images_json JSON NULL")
+        add_col('clinical_analyses', 'detected_conditions',"detected_conditions JSON NULL")
+        add_col('clinical_analyses', 'updated_at',         "updated_at TIMESTAMP NULL DEFAULT NULL")
+        add_col('clinical_analyses', 'error_message',      "error_message TEXT NULL")
+        add_col('clinical_analyses', 'mode',               "mode VARCHAR(10) NOT NULL DEFAULT 'full'")
 
-        # Check if an index named idx_status_created exists
+        # Composite index on (status, created_at)
         cur.execute("""
             SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
             WHERE TABLE_SCHEMA = DATABASE()
@@ -134,16 +132,7 @@ def ensure_columns():
         """)
         name_exists = (cur.fetchone()[0] > 0)
 
-        # Or an equivalent composite index on (status, created_at) already exists under a different name
-        cur.execute("""
-            SELECT INDEX_NAME
-            FROM INFORMATION_SCHEMA.STATISTICS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME='clinical_analyses'
-            ORDER BY SEQ_IN_INDEX
-        """)
-        rows = cur.fetchall()
-        # Build {index_name: [col1, col2, ...]} map
+        # Or equivalent composite index (status, created_at) under any name
         cur.execute("""
             SELECT INDEX_NAME, COLUMN_NAME, SEQ_IN_INDEX
             FROM INFORMATION_SCHEMA.STATISTICS
@@ -154,20 +143,17 @@ def ensure_columns():
         idx_cols = {}
         for idx_name, col_name, seq in cur.fetchall():
             idx_cols.setdefault(idx_name, []).append(col_name)
-
-        equivalent_exists = any(cols == ['status', 'created_at'] for cols in idx_cols.values())
+        equivalent_exists = any(cols == ['status','created_at'] for cols in idx_cols.values())
 
         if not name_exists and not equivalent_exists:
             try:
                 cur.execute("ALTER TABLE clinical_analyses ADD INDEX idx_status_created (status, created_at)")
             except mysql.connector.Error as e:
-                # Ignore duplicate key error if another process created it moments ago
-                if e.errno != 1061:
+                if e.errno != 1061:  # ignore "duplicate key" if created concurrently
                     raise
 
         conn.commit()
     except Exception as e:
-        # Keep running even if schema tweak failed; just log once.
         print("ensure_columns error (non-fatal):", e)
     finally:
         try:
@@ -175,16 +161,13 @@ def ensure_columns():
         except:
             pass
 
-
-
 def get_prompt_modifier(specialty_slug: str) -> str:
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
         cursor.execute("SELECT prompt_modifier FROM specialties WHERE slug = %s", (specialty_slug,))
         row = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        cursor.close(); conn.close()
         return row["prompt_modifier"] if row and row.get("prompt_modifier") else ""
     except Error as e:
         print("DB error getting specialty modifier:", e)
@@ -227,7 +210,8 @@ def image_file_to_png_bytes(fstorage) -> tuple[bytes, str]:
     im = PILImage.open(io.BytesIO(raw))
     return pil_to_png_bytes(im), "image"
 
-
+def b64_data_uri(png_bytes: bytes) -> str:
+    return "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
 
 # ---------- Core measure guidance mapping ----------
 GUIDANCE_DATA = {
@@ -269,7 +253,7 @@ GUIDANCE_DATA = {
     }
 }
 
-# ---------- Common GPT-5 analysis logic ----------
+# ---------- Analysis logic ----------
 def build_prompt(note: str, specialty: str, images_meta_text: str, detected_conditions):
     modifier = get_prompt_modifier(specialty)
     extra_guidance = "\n".join(
@@ -326,7 +310,6 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
 
     resp = client.chat.completions.create(
         model="gpt-5",
-        #model="gpt-4o",
         messages=[
             {"role": "system", "content": "You are a medical expert that returns only formatted diagnostic analysis."},
             {"role": "user", "content": content_blocks}
@@ -334,6 +317,29 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
     )
     full_response = resp.choices[0].message.content.strip()
     return full_response, detected_conditions
+
+def run_fast_analysis(note: str, specialty: str):
+    """Small prompt / small output for quick triage."""
+    prompt = f"""
+Return JSON with these keys only:
+- differentials: top 3 (short phrases, <= 6 words each)
+- initial_actions: up to 5 bullets (<= 10 words each)
+- red_flags: up to 5 bullets (<= 10 words each)
+
+Patient note:
+{note[:2000]}
+"""
+    resp = client.chat.completions.create(
+        model=FAST_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a concise clinical triage assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+        max_tokens=350,
+        response_format={"type": "json_object"},
+    )
+    return resp.choices[0].message.content  # JSON string; detected skipped
 
 # ---------- Routes ----------
 @app.route('/')
@@ -410,10 +416,15 @@ def queue_analysis():
         images_data_uris, filenames_meta = [], []
         note = ''
         specialty = 'general'
+        doctor_id = None
+        mode = 'full'
 
         if request.files:
             note = (request.form.get("note") or "").strip()
             specialty = request.form.get("specialty", "general")
+            doctor_id = request.form.get("doctor_id")
+            m = (request.form.get("mode") or "full").lower()
+            mode = m if m in ("fast","full") else "full"
             for idx, f in enumerate(request.files.getlist("images")):
                 if idx >= MAX_IMAGES or not file_ok(f.filename):
                     continue
@@ -427,7 +438,9 @@ def queue_analysis():
             data = request.get_json(silent=True) or {}
             note = (data.get("note") or "").strip()
             specialty = data.get("specialty", "general")
-            doctor_id = data.get("doctor_id")  # may be None
+            doctor_id = data.get("doctor_id")
+            m = (data.get("mode") or "full").lower()
+            mode = m if m in ("fast","full") else "full"
 
         if not note:
             return jsonify({"error": "Missing clinical note"}), 400
@@ -438,9 +451,9 @@ def queue_analysis():
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO clinical_analyses (doctor_id, patient_name, specialty, note, status, images_json, created_at)
-            VALUES (%s, %s, %s, %s, 'pending', %s, CURRENT_TIMESTAMP)
-        """, (doctor_id, patient_name, specialty, note, json.dumps(images_data_uris or [])))
+            INSERT INTO clinical_analyses (doctor_id, patient_name, specialty, note, status, images_json, mode, created_at)
+            VALUES (%s, %s, %s, %s, 'pending', %s, %s, CURRENT_TIMESTAMP)
+        """, (doctor_id, patient_name, specialty, note, json.dumps(images_data_uris or []), mode))
         analysis_id = cursor.lastrowid
         conn.commit()
         cursor.close(); conn.close()
@@ -462,7 +475,7 @@ def get_analysis():
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
-            SELECT id, patient_name, specialty, note, analysis, status, images_json, detected_conditions, created_at, updated_at
+            SELECT id, patient_name, specialty, note, analysis, status, images_json, detected_conditions, mode, created_at, updated_at
             FROM clinical_analyses WHERE id = %s
         """, (analysis_id,))
         record = cursor.fetchone()
@@ -502,7 +515,7 @@ def process_pending_jobs():
             # Prefer SKIP LOCKED on MySQL 8.0+
             try:
                 cursor.execute("""
-                    SELECT id, patient_name, specialty, note, images_json
+                    SELECT id, patient_name, specialty, note, images_json, mode
                     FROM clinical_analyses
                     WHERE status = 'pending'
                     ORDER BY created_at ASC
@@ -512,7 +525,7 @@ def process_pending_jobs():
             except mysql.connector.errors.ProgrammingError:
                 # Fallback for MySQL < 8.0 (no SKIP LOCKED)
                 cursor.execute("""
-                    SELECT id, patient_name, specialty, note, images_json
+                    SELECT id, patient_name, specialty, note, images_json, mode
                     FROM clinical_analyses
                     WHERE status = 'pending'
                     ORDER BY created_at ASC
@@ -531,10 +544,10 @@ def process_pending_jobs():
             cursor.close(); conn.close()
 
             if not job:
-                time.sleep(2)
+                time.sleep(0.25)  # light idle
                 continue
 
-            print(f"[worker] Processing analysis {job['id']}...")
+            print(f"[worker] Processing analysis {job['id']} (mode={job.get('mode','full')})...")
 
             # --- do the work ---
             try:
@@ -545,12 +558,17 @@ def process_pending_jobs():
                     pass
                 filenames_meta = [f"image_{i+1}.png (queued)" for i in range(len(images_data_uris))]
 
-                analysis_result, detected = run_gpt5_analysis(
-                    note=job['note'],
-                    specialty=job['specialty'],
-                    images_data_uris=images_data_uris,
-                    filenames_meta=filenames_meta
-                )
+                mode = (job.get('mode') or 'full').lower()
+                if mode == 'fast':
+                    analysis_result = run_fast_analysis(job['note'], job['specialty'])
+                    detected = []  # skip heavy detection for fast path
+                else:
+                    analysis_result, detected = run_gpt5_analysis(
+                        note=job['note'],
+                        specialty=job['specialty'],
+                        images_data_uris=images_data_uris,
+                        filenames_meta=filenames_meta
+                    )
 
                 conn = get_connection()
                 cursor = conn.cursor()
@@ -587,7 +605,7 @@ def process_pending_jobs():
 
         except Exception as loop_err:
             print("[worker] loop error:", loop_err)
-            time.sleep(5)
+            time.sleep(2)
 
 @app.route('/health')
 def health():
@@ -666,13 +684,7 @@ def compare():
             return render_template_string(HTML_TEMPLATE, record1=record1, record2=record2)
     except Exception as e:
         return jsonify({"error": f"DB compare error: {str(e)}"}), 500
-    
+
 if __name__ == '__main__':
-    # Start worker once
     threading.Thread(target=process_pending_jobs, daemon=True).start()
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False, threaded=True)
-    
-
-#if __name__ == '__main__':
-   # port = int(os.environ.get("PORT", 5000))
-    #app.run(host='0.0.0.0', port=port)

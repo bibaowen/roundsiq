@@ -51,7 +51,7 @@ DB_PORT = int(os.getenv("DB_PORT", 3306))
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "default_secret_key")
 
-# NEW — allow your web app to call Flask from another origin/port
+# CORS
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
 HTML_TEMPLATE = """
@@ -115,13 +115,14 @@ def ensure_columns():
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
         # Columns our code relies on
-        add_col('clinical_analyses', 'doctor_id',          "doctor_id INT UNSIGNED NULL")
-        add_col('clinical_analyses', 'status',             "status VARCHAR(20) NOT NULL DEFAULT 'completed'")
-        add_col('clinical_analyses', 'images_json',        "images_json JSON NULL")
-        add_col('clinical_analyses', 'detected_conditions',"detected_conditions JSON NULL")
-        add_col('clinical_analyses', 'updated_at',         "updated_at TIMESTAMP NULL DEFAULT NULL")
-        add_col('clinical_analyses', 'error_message',      "error_message TEXT NULL")
-        add_col('clinical_analyses', 'mode',               "mode VARCHAR(10) NOT NULL DEFAULT 'full'")
+        add_col('clinical_analyses', 'doctor_id',           "doctor_id INT UNSIGNED NULL")
+        add_col('clinical_analyses', 'status',              "status VARCHAR(20) NOT NULL DEFAULT 'completed'")
+        add_col('clinical_analyses', 'images_json',         "images_json JSON NULL")
+        add_col('clinical_analyses', 'detected_conditions', "detected_conditions JSON NULL")
+        add_col('clinical_analyses', 'updated_at',          "updated_at TIMESTAMP NULL DEFAULT NULL")
+        add_col('clinical_analyses', 'error_message',       "error_message TEXT NULL")
+        add_col('clinical_analyses', 'mode',                "mode VARCHAR(10) NOT NULL DEFAULT 'full'")
+        add_col('clinical_analyses', 'upgrade_to_id',       "upgrade_to_id INT UNSIGNED NULL")
 
         # Composite index on (status, created_at)
         cur.execute("""
@@ -149,7 +150,7 @@ def ensure_columns():
             try:
                 cur.execute("ALTER TABLE clinical_analyses ADD INDEX idx_status_created (status, created_at)")
             except mysql.connector.Error as e:
-                if e.errno != 1061:  # ignore "duplicate key" if created concurrently
+                if e.errno != 1061:
                     raise
 
         conn.commit()
@@ -215,42 +216,24 @@ def b64_data_uri(png_bytes: bytes) -> str:
 
 # ---------- Core measure guidance mapping ----------
 GUIDANCE_DATA = {
-    "sepsis": {
-        "triggers": ["sepsis", "septic shock", "severe sepsis", "sep-1"],
-        "prompt": "Analyze this case for sepsis management per CMS SEP-1 and Surviving Sepsis Campaign guidelines. Provide a detailed 3- and 6-hour bundle checklist, diagnostic workup, empiric antibiotic options with doses, initial fluid resuscitation details (including volume/kg), vasopressor initiation criteria and agents, lactate monitoring, source control measures, and reassessment plan. Include CMS compliance checklist and references."
-    },
-    "heart failure": {
-        "triggers": ["heart failure", "hf", "chf", "congestive heart failure"],
-        "prompt": "Generate a detailed inpatient heart failure management plan per CMS HF core measures and AHA/ACC guidelines. Include diagnostic evaluation, IV diuretic regimen with dosing and monitoring, guideline-directed medical therapy (GDMT) optimization, discharge education requirements, follow-up planning, and documentation points to meet CMS HF-1 (LV function assessment, discharge instructions, ACEi/ARB/ARNI). Provide quality measure checklist and guideline references."
-    },
-    "ami": {
-        "triggers": ["ami", "acute myocardial infarction", "mi", "stemi", "nstemi"],
-        "prompt": "Provide a comprehensive AMI management plan per CMS AMI core measures and ACC/AHA guidelines. Include reperfusion strategy timing (PCI vs. fibrinolysis), antiplatelet and anticoagulant dosing, adjunctive medications, monitoring parameters, discharge medication list per CMS AMI-10, smoking cessation counseling requirements, and documentation needed for CMS compliance. Include relevant guideline citations."
-    },
-    "stroke": {
-        "triggers": ["stroke", "tia", "cva", "transient ischemic attack", "ischemic stroke"],
-        "prompt": "Generate an acute ischemic stroke management plan per CMS stroke core measures and AHA/ASA guidelines. Include eligibility assessment for thrombolysis or thrombectomy, antiplatelet therapy timing/dosing, dysphagia screening steps, DVT prophylaxis, statin initiation, BP management targets, and patient/family education. Provide CMS STK-1 to STK-10 checklist with documentation requirements and references."
-    },
-    "vte": {
-        "triggers": ["vte", "venous thromboembolism", "dvt", "deep vein thrombosis", "pe", "pulmonary embolism"],
-        "prompt": "Develop a detailed plan for VTE prophylaxis or treatment per CMS VTE core measures and CHEST guidelines. Include risk stratification, agent selection with dosing, timing, contraindication documentation, and discharge anticoagulation education requirements. Include CMS VTE-1 and VTE-2 compliance checklist and references."
-    },
-    "pneumonia": {
-        "triggers": ["pneumonia", "cap", "community acquired pneumonia", "hap", "hospital acquired pneumonia", "vap", "ventilator associated pneumonia"],
-        "prompt": "Provide an inpatient pneumonia management plan per CMS PN core measures and IDSA/ATS guidelines. Include diagnostic workup, empiric antibiotic regimens with doses (CAP vs. HAP/VAP), timing of first dose, blood culture guidance, oxygenation assessment, vaccine counseling, and discharge planning. Provide CMS compliance checklist and references."
-    },
-    "scip": {
-        "triggers": ["scip", "surgical care improvement", "perioperative infection prevention"],
-        "prompt": "Create a perioperative infection prevention checklist per CMS SCIP core measures. Include antibiotic selection/timing/dosing, appropriate discontinuation timing, perioperative glucose control, normothermia maintenance, and hair removal recommendations. Include CMS SCIP compliance points and references."
-    },
-    "readmission": {
-        "triggers": ["readmission", "hrpp", "high risk discharge"],
-        "prompt": "Provide a high-risk discharge management plan to prevent readmission per CMS HRRP quality measures. Include patient risk stratification, discharge medication reconciliation, follow-up appointment scheduling, post-discharge call checklist, home health referrals, and education requirements. Include references to CMS readmission prevention standards."
-    },
-    "dka": {
-        "triggers": ["dka", "diabetic ketoacidosis", "hhs", "hyperosmolar hyperglycemic state"],
-        "prompt": "Generate a detailed inpatient management plan for DKA or HHS per ADA guidelines and hospital best practices. Include diagnostic criteria, stepwise fluid resuscitation plan (type, volume, and rate), insulin therapy with dosing and transition to subcutaneous insulin, electrolyte monitoring and replacement (potassium, phosphate), identification and treatment of precipitating factors, criteria for resolution, and patient education prior to discharge. Include CMS quality documentation requirements and references."
-    }
+    "sepsis": {"triggers": ["sepsis", "septic shock", "severe sepsis", "sep-1"],
+               "prompt": "Analyze this case for sepsis management per CMS SEP-1 and Surviving Sepsis Campaign guidelines. Provide a detailed 3- and 6-hour bundle checklist, diagnostic workup, empiric antibiotic options with doses, initial fluid resuscitation details (including volume/kg), vasopressor initiation criteria and agents, lactate monitoring, source control measures, and reassessment plan. Include CMS compliance checklist and references."},
+    "heart failure": {"triggers": ["heart failure", "hf", "chf", "congestive heart failure"],
+                      "prompt": "Generate a detailed inpatient heart failure management plan per CMS HF core measures and AHA/ACC guidelines. Include diagnostic evaluation, IV diuretic regimen with dosing and monitoring, guideline-directed medical therapy (GDMT) optimization, discharge education requirements, follow-up planning, and documentation points to meet CMS HF-1 (LV function assessment, discharge instructions, ACEi/ARB/ARNI). Provide quality measure checklist and guideline references."},
+    "ami": {"triggers": ["ami", "acute myocardial infarction", "mi", "stemi", "nstemi"],
+            "prompt": "Provide a comprehensive AMI management plan per CMS AMI core measures and ACC/AHA guidelines. Include reperfusion strategy timing (PCI vs. fibrinolysis), antiplatelet and anticoagulant dosing, adjunctive medications, monitoring parameters, discharge medication list per CMS AMI-10, smoking cessation counseling requirements, and documentation needed for CMS compliance. Include relevant guideline citations."},
+    "stroke": {"triggers": ["stroke", "tia", "cva", "transient ischemic attack", "ischemic stroke"],
+               "prompt": "Generate an acute ischemic stroke management plan per CMS stroke core measures and AHA/ASA guidelines. Include eligibility assessment for thrombolysis or thrombectomy, antiplatelet therapy timing/dosing, dysphagia screening steps, DVT prophylaxis, statin initiation, BP management targets, and patient/family education. Provide CMS STK-1 to STK-10 checklist with documentation requirements and references."},
+    "vte": {"triggers": ["vte", "venous thromboembolism", "dvt", "deep vein thrombosis", "pe", "pulmonary embolism"],
+            "prompt": "Develop a detailed plan for VTE prophylaxis or treatment per CMS VTE core measures and CHEST guidelines. Include risk stratification, agent selection with dosing, timing, contraindication documentation, and discharge anticoagulation education requirements. Include CMS VTE-1 and VTE-2 compliance checklist and references."},
+    "pneumonia": {"triggers": ["pneumonia", "cap", "community acquired pneumonia", "hap", "hospital acquired pneumonia", "vap", "ventilator associated pneumonia"],
+                  "prompt": "Provide an inpatient pneumonia management plan per CMS PN core measures and IDSA/ATS guidelines. Include diagnostic workup, empiric antibiotic regimens with doses (CAP vs. HAP/VAP), timing of first dose, blood culture guidance, oxygenation assessment, vaccine counseling, and discharge planning. Provide CMS compliance checklist and references."},
+    "scip": {"triggers": ["scip", "surgical care improvement", "perioperative infection prevention"],
+             "prompt": "Create a perioperative infection prevention checklist per CMS SCIP core measures. Include antibiotic selection/timing/dosing, appropriate discontinuation timing, perioperative glucose control, normothermia maintenance, and hair removal recommendations. Include CMS SCIP compliance points and references."},
+    "readmission": {"triggers": ["readmission", "hrpp", "high risk discharge"],
+                    "prompt": "Provide a high-risk discharge management plan to prevent readmission per CMS HRRP quality measures. Include patient risk stratification, discharge medication reconciliation, follow-up appointment scheduling, post-discharge call checklist, home health referrals, and education requirements. Include references to CMS readmission prevention standards."},
+    "dka": {"triggers": ["dka", "diabetic ketoacidosis", "hhs", "hyperosmolar hyperglycemic state"],
+            "prompt": "Generate a detailed inpatient management plan for DKA or HHS per ADA guidelines and hospital best practices. Include diagnostic criteria, stepwise fluid resuscitation plan (type, volume, and rate), insulin therapy with dosing and transition to subcutaneous insulin, electrolyte monitoring and replacement (potassium, phosphate), identification and treatment of precipitating factors, criteria for resolution, and patient education prior to discharge. Include CMS quality documentation requirements and references."}
 }
 
 # ---------- Analysis logic ----------
@@ -260,7 +243,6 @@ def build_prompt(note: str, specialty: str, images_meta_text: str, detected_cond
         f"\n### SPECIAL GUIDANCE: {cond.upper()}\n{GUIDANCE_DATA[cond]['prompt']}"
         for cond in detected_conditions
     )
-
     prompt_text = f"""You are a highly trained clinical decision support AI.
 Analyze the clinical case below and return structured diagnostic reasoning using these 10 sections:
 
@@ -475,7 +457,8 @@ def get_analysis():
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
-            SELECT id, patient_name, specialty, note, analysis, status, images_json, detected_conditions, mode, created_at, updated_at
+            SELECT id, patient_name, specialty, note, analysis, status, images_json,
+                   detected_conditions, mode, upgrade_to_id, created_at, updated_at
             FROM clinical_analyses WHERE id = %s
         """, (analysis_id,))
         record = cursor.fetchone()
@@ -515,7 +498,7 @@ def process_pending_jobs():
             # Prefer SKIP LOCKED on MySQL 8.0+
             try:
                 cursor.execute("""
-                    SELECT id, patient_name, specialty, note, images_json, mode
+                    SELECT id, doctor_id, patient_name, specialty, note, images_json, mode
                     FROM clinical_analyses
                     WHERE status = 'pending'
                     ORDER BY created_at ASC
@@ -525,7 +508,7 @@ def process_pending_jobs():
             except mysql.connector.errors.ProgrammingError:
                 # Fallback for MySQL < 8.0 (no SKIP LOCKED)
                 cursor.execute("""
-                    SELECT id, patient_name, specialty, note, images_json, mode
+                    SELECT id, doctor_id, patient_name, specialty, note, images_json, mode
                     FROM clinical_analyses
                     WHERE status = 'pending'
                     ORDER BY created_at ASC
@@ -559,31 +542,61 @@ def process_pending_jobs():
                 filenames_meta = [f"image_{i+1}.png (queued)" for i in range(len(images_data_uris))]
 
                 mode = (job.get('mode') or 'full').lower()
+
                 if mode == 'fast':
+                    # 1) Fast triage
                     analysis_result = run_fast_analysis(job['note'], job['specialty'])
-                    detected = []  # skip heavy detection for fast path
+                    detected = []  # skip heavy detection for fast pass
+
+                    # 2) Enqueue FULL follow-up job
+                    conn = get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO clinical_analyses
+                            (doctor_id, patient_name, specialty, note, status, images_json, mode, created_at)
+                        VALUES
+                            (%s, %s, %s, %s, 'pending', %s, 'full', CURRENT_TIMESTAMP)
+                    """, (job.get('doctor_id'), job['patient_name'], job['specialty'],
+                          job['note'], json.dumps(images_data_uris or [])))
+                    full_id = cursor.lastrowid
+
+                    # 3) Save fast result & pointer to upgrade
+                    cursor.execute("""
+                        UPDATE clinical_analyses
+                        SET analysis = %s,
+                            status = 'completed_fast',
+                            detected_conditions = %s,
+                            upgrade_to_id = %s,
+                            updated_at = CURRENT_TIMESTAMP,
+                            error_message = NULL
+                        WHERE id = %s
+                    """, (analysis_result, json.dumps(detected), full_id, job['id']))
+                    conn.commit()
+                    cursor.close(); conn.close()
+                    print(f"[worker] Fast pass completed for {job['id']} → full job {full_id}")
+
                 else:
+                    # FULL analysis
                     analysis_result, detected = run_gpt5_analysis(
                         note=job['note'],
                         specialty=job['specialty'],
                         images_data_uris=images_data_uris,
                         filenames_meta=filenames_meta
                     )
-
-                conn = get_connection()
-                cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE clinical_analyses
-                    SET analysis = %s,
-                        status = 'completed',
-                        detected_conditions = %s,
-                        updated_at = CURRENT_TIMESTAMP,
-                        error_message = NULL
-                    WHERE id = %s
-                """, (analysis_result, json.dumps(detected), job['id']))
-                conn.commit()
-                cursor.close(); conn.close()
-                print(f"[worker] Completed analysis {job['id']}")
+                    conn = get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE clinical_analyses
+                        SET analysis = %s,
+                            status = 'completed',
+                            detected_conditions = %s,
+                            updated_at = CURRENT_TIMESTAMP,
+                            error_message = NULL
+                        WHERE id = %s
+                    """, (analysis_result, json.dumps(detected), job['id']))
+                    conn.commit()
+                    cursor.close(); conn.close()
+                    print(f"[worker] Full analysis completed for {job['id']}")
 
             except Exception as proc_err:
                 err_text = f"{type(proc_err).__name__}: {proc_err}"

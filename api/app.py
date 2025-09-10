@@ -15,7 +15,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing. Set it in .env or environment variables.")
 
-FAST_MODEL = os.getenv("FAST_MODEL", "gpt-5")  # fast lane model
+# Models / token budgets
+FAST_MODEL = os.getenv("FAST_MODEL", "gpt-4o-mini")  # fast lane model (short outputs)
+FULL_MODEL = os.getenv("FULL_MODEL", "gpt-5")        # detailed write-up model
+FULL_MAX_TOKENS = int(os.getenv("FULL_MAX_TOKENS", "3000"))
 
 # ---------- Image handling dependencies ----------
 try:
@@ -32,14 +35,17 @@ try:
 except Exception:
     HAVE_DICOM = False
 
-# ---------- OpenAI client with faster-fail timeouts ----------
-client_timeout = httpx.Timeout(20.0, read=30.0, write=20.0, connect=10.0)
+# ---------- OpenAI clients: FAST (short) and FULL (long) ----------
 proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
-if proxy:
-    http_client = httpx.Client(proxies=proxy, timeout=client_timeout)
-else:
-    http_client = httpx.Client(timeout=client_timeout)
-client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+
+FAST_TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=10.0, timeout=20.0)
+FULL_TIMEOUT = httpx.Timeout(connect=20.0, read=210.0, write=60.0, timeout=240.0)
+
+fast_http = httpx.Client(timeout=FAST_TIMEOUT, proxies=proxy) if proxy else httpx.Client(timeout=FAST_TIMEOUT)
+full_http = httpx.Client(timeout=FULL_TIMEOUT, proxies=proxy) if proxy else httpx.Client(timeout=FULL_TIMEOUT)
+
+fast_client = OpenAI(api_key=OPENAI_API_KEY, http_client=fast_http)
+full_client = OpenAI(api_key=OPENAI_API_KEY, http_client=full_http)
 
 # ---------- Database settings ----------
 DB_HOST = os.getenv("DB_HOST")
@@ -133,25 +139,19 @@ def ensure_columns():
         """)
         name_exists = (cur.fetchone()[0] > 0)
 
-        # Or equivalent composite index (status, created_at) under any name
-        cur.execute("""
-            SELECT INDEX_NAME, COLUMN_NAME, SEQ_IN_INDEX
-            FROM INFORMATION_SCHEMA.STATISTICS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME='clinical_analyses'
-            ORDER BY INDEX_NAME, SEQ_IN_INDEX
-        """)
-        idx_cols = {}
-        for idx_name, col_name, seq in cur.fetchall():
-            idx_cols.setdefault(idx_name, []).append(col_name)
-        equivalent_exists = any(cols == ['status','created_at'] for cols in idx_cols.values())
-
-        if not name_exists and not equivalent_exists:
+        if not name_exists:
             try:
                 cur.execute("ALTER TABLE clinical_analyses ADD INDEX idx_status_created (status, created_at)")
             except mysql.connector.Error as e:
                 if e.errno != 1061:
                     raise
+
+        # Index for upgrade follow-ups
+        try:
+            cur.execute("CREATE INDEX idx_upgrade_to ON clinical_analyses (upgrade_to_id)")
+        except mysql.connector.Error as e:
+            if e.errno != 1061:
+                raise
 
         conn.commit()
     except Exception as e:
@@ -285,23 +285,25 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
         detected_conditions=detected_conditions
     )
 
-    # Build content blocks (vision support if images provided)
     content_blocks = [{"type": "text", "text": prompt_text}]
     for uri in images_data_uris:
         content_blocks.append({"type": "image_url", "image_url": {"url": uri}})
 
-    resp = client.chat.completions.create(
-        model="gpt-5",
+    # Use FULL client with long timeouts + generous token budget
+    resp = full_client.chat.completions.create(
+        model=FULL_MODEL,
         messages=[
             {"role": "system", "content": "You are a medical expert that returns only formatted diagnostic analysis."},
             {"role": "user", "content": content_blocks}
         ],
+        temperature=0.2,
+        max_tokens=FULL_MAX_TOKENS,
     )
     full_response = resp.choices[0].message.content.strip()
     return full_response, detected_conditions
 
 def run_fast_analysis(note: str, specialty: str):
-    """Small prompt / small output for quick triage."""
+    """Small prompt / small output for quick triage (JSON)."""
     prompt = f"""
 Return JSON with these keys only:
 - differentials: top 3 (short phrases, <= 6 words each)
@@ -311,17 +313,17 @@ Return JSON with these keys only:
 Patient note:
 {note[:2000]}
 """
-    resp = client.chat.completions.create(
+    resp = fast_client.chat.completions.create(
         model=FAST_MODEL,
         messages=[
             {"role": "system", "content": "You are a concise clinical triage assistant."},
             {"role": "user", "content": prompt},
         ],
         temperature=0.2,
-        max_tokens=350,
+        max_tokens=400,
         response_format={"type": "json_object"},
     )
-    return resp.choices[0].message.content  # JSON string; detected skipped
+    return resp.choices[0].message.content  # JSON string
 
 # ---------- Routes ----------
 @app.route('/')
@@ -359,7 +361,7 @@ def analyze():
 
         patient_name = note.split(",")[0].strip() if "," in note else "Unknown"
 
-        # Run GPT-5 (blocking)
+        # Run FULL (blocking)
         analysis, detected = run_gpt5_analysis(note, specialty, images_data_uris, filenames_meta)
 
         # Save to DB
@@ -506,7 +508,7 @@ def process_pending_jobs():
                     FOR UPDATE SKIP LOCKED
                 """)
             except mysql.connector.errors.ProgrammingError:
-                # Fallback for MySQL < 8.0 (no SKIP LOCKED)
+                # Fallback (no SKIP LOCKED)
                 cursor.execute("""
                     SELECT id, doctor_id, patient_name, specialty, note, images_json, mode
                     FROM clinical_analyses
@@ -576,7 +578,7 @@ def process_pending_jobs():
                     print(f"[worker] Fast pass completed for {job['id']} → full job {full_id}")
 
                 else:
-                    # FULL analysis
+                    # FULL analysis (long timeout + big token budget)
                     analysis_result, detected = run_gpt5_analysis(
                         note=job['note'],
                         specialty=job['specialty'],

@@ -321,15 +321,20 @@ Return JSON with these keys only:
 Patient note:
 {note[:2000]}
 """.strip()
-    
+
     resp = fast_client.chat.completions.create(
         model=FAST_MODEL,
-        messages=[ ... ],
+        messages=[
+            {"role": "system", "content": "You are a concise clinical triage assistant. Respond with a single valid JSON object."},
+            {"role": "user", "content": prompt},
+        ],
         temperature=0.2,
-        max_completion_tokens=350,         # ← was max_tokens
+        # your SDK doesn’t accept max_completion_tokens as a top-level kwarg
+        extra_body={"max_completion_tokens": 350, "max_output_tokens": 350},
         response_format={"type": "json_object"},
     )
     return (resp.choices[0].message.content or "").strip()
+
 
 # ---------- FULL analysis (rich 10-section write-up with repair) ----------
 def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenames_meta: list):
@@ -342,20 +347,24 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
         detected_conditions=detected_conditions,
     )
 
-    # Compose vision content (text + optional images)
+    # Vision content (text + optional images)
     content_blocks = [{"type": "text", "text": prompt_text}]
     for uri in images_data_uris or []:
         content_blocks.append({"type": "image_url", "image_url": {"url": uri}})
 
+    # First attempt
     resp = full_client.chat.completions.create(
-        model=FULL_MODEL,
-        messages=[ ... ],
+        model=FULL_MODEL,  # e.g., "gpt-5"
+        messages=[
+            {"role": "system", "content": "You are a medical expert that returns only a well-structured, comprehensive 10-section diagnostic analysis."},
+            {"role": "user", "content": content_blocks},
+        ],
         temperature=0.2,
-        max_completion_tokens=2800,        # ← was max_tokens
-)
+        extra_body={"max_completion_tokens": 2800, "max_output_tokens": 2800},
+    )
     draft = (resp.choices[0].message.content or "").strip()
 
-    # Repair to enforce the exact 10 headings if needed
+    # Repair if the exact H2 headings aren’t present
     if not _has_enough_sections(draft):
         repair_prompt = f"""
 Rewrite the following draft into EXACTLY these 10 H2 sections (no extra sections,
@@ -366,17 +375,22 @@ no intro/outro text). Use the headings verbatim:
 Draft to rewrite:
 {draft}
 """.strip()
+
         resp2 = full_client.chat.completions.create(
             model=FULL_MODEL,
-            messages=[ ... ],
+            messages=[
+                {"role": "system", "content": "Rewrite strictly into the exact 10 requested H2 sections. Do not add other sections."},
+                {"role": "user", "content": repair_prompt},
+            ],
             temperature=0.1,
-            max_completion_tokens=2200,        # ← was max_tokens
+            extra_body={"max_completion_tokens": 2200, "max_output_tokens": 2200},
         )
         final_text = (resp2.choices[0].message.content or "").strip()
         if _has_enough_sections(final_text):
             draft = final_text
 
     return draft, detected_conditions
+
 
 # ---------- Routes ----------
 @app.route('/')

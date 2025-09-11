@@ -20,6 +20,10 @@ if not OPENAI_API_KEY:
 FULL_MODEL = os.getenv("FULL_MODEL", "gpt-5")
 FAST_MODEL = os.getenv("FAST_MODEL", "gpt-4o-mini")  # keep FAST truly fast
 
+SSE_VERBOSE = os.getenv("SSE_VERBOSE", "0") == "1"
+STRICT_STREAM = os.getenv("STRICT_STREAM", "0") == "1"  # optional
+
+
 # ---------- Image handling dependencies ----------
 try:
     from PIL import Image as PILImage
@@ -478,41 +482,45 @@ def analyze_stream():
             full_text_parts = []
             emitted_any = False
 
-            # 1) Try true streaming
+            # 1) Try true streaming with FULL_MODEL (e.g., gpt-5)
             try:
                 resp = full_client.chat.completions.create(
                     model=FULL_MODEL,
                     messages=messages,
                     stream=True,
-                    extra_body={"max_completion_tokens": 2000},
+                    extra_body={"max_completion_tokens": 3200},
                 )
                 for chunk in resp:
                     try:
                         choice = chunk.choices[0]
                     except Exception:
                         continue
-
                     delta = getattr(choice, "delta", None)
-                    token = ""
-                    if delta is not None:
-                        token = getattr(delta, "content", "") or ""
-                    else:
-                        token = getattr(choice, "text", "") or ""
-
-                    if token:
-                        full_text_parts.append(token)
-                        emitted_any = True
-                        yield f"event: token\ndata:{json.dumps(token)}\n\n"
+                    token = getattr(delta, "content", "") if delta else ""
+                    if not token:
+                        continue
+                    full_text_parts.append(token)
+                    emitted_any = True
+                    yield f"event: token\ndata:{json.dumps(token)}\n\n"
 
             except BadRequestError as e:
-                # Org not verified for streaming, etc.
-                yield f"event: warn\ndata:{json.dumps('Streaming not available; falling back to full response.')}\n\n"
+                if SSE_VERBOSE:
+                    yield f"event: warn\ndata:{json.dumps('Streaming not available; using fallback.')}\\n\\n"
+                app.logger.warning(f"Streaming BadRequestError: {e}")
             except Exception as e:
-                yield f"event: warn\ndata:{json.dumps('Streaming error: ' + str(e))}\n\n"
+                if SSE_VERBOSE:
+                    yield f"event: warn\ndata:{json.dumps('Streaming error: ' + str(e))}\\n\\n"
+                app.logger.warning(f"Streaming error: {e}")
 
-                       # 2) Fallback if no tokens were emitted
+            # 2) Optional strict mode: do not fallback
+            if not emitted_any and STRICT_STREAM:
+                if SSE_VERBOSE:
+                    yield f"event: error\ndata:{json.dumps('Streaming failed (strict mode).')}\\n\\n"
+                return
+
+            # 3) Fallback only if no tokens were emitted
             if not emitted_any:
-                fallback_models = [FULL_MODEL, "gpt-4o", "gpt-4o-mini"]
+                fallback_models = ["gpt-4o", "gpt-4o-mini"]
                 analysis = ""
                 last_reason = None
 
@@ -521,55 +529,53 @@ def analyze_stream():
                         resp_full = full_client.chat.completions.create(
                             model=m,
                             messages=messages,
-                            # keep it boring to avoid filter surprises
-                            temperature=0.2,
+                            # No temperature/top_p for maximum compatibility
                             extra_body={"max_completion_tokens": 3200},
                         )
                         choice = resp_full.choices[0]
                         last_reason = getattr(choice, "finish_reason", None)
                         text = (choice.message.content or "").strip()
 
-                        # Surface what happened
-                        yield f"event: debug\ndata:{json.dumps({'model': m, 'finish_reason': last_reason})}\n\n"
+                        if SSE_VERBOSE:
+                            yield f"event: debug\ndata:{json.dumps({'model': m, 'finish_reason': last_reason})}\\n\\n"
 
                         if text:
                             analysis = text
                             break
-
-                        # If content filter tripped or we got nothing, try next model
-                        if last_reason in ("content_filter", None) or text == "":
-                            continue
-
                     except Exception as e2:
-                        yield f"event: warn\ndata:{json.dumps(f'Fallback call failed on {m}: {str(e2)[:160]}')}\n\n"
+                        app.logger.warning(f"Fallback call failed on {m}: {e2}")
+                        if SSE_VERBOSE:
+                            yield f"event: warn\ndata:{json.dumps(f'Fallback call failed on {m}: {str(e2)[:160]}')}\\n\\n"
                         continue
 
                 if analysis:
-                    yield f"event: token\ndata:{json.dumps(analysis)}\n\n"
+                    full_text_parts.append(analysis)  # <-- ensure we persist it
+                    yield f"event: token\ndata:{json.dumps(analysis)}\\n\\n"
                 else:
-                    msg = "All fallbacks returned empty text"
-                    if last_reason:
-                        msg += f" (finish_reason={last_reason})"
-                    yield f"event: error\ndata:{json.dumps(msg)}\n\n"
+                    msg = f"All fallbacks returned empty text (finish_reason={last_reason})"
+                    app.logger.error(msg)
+                    if SSE_VERBOSE:
+                        yield f"event: error\ndata:{json.dumps(msg)}\\n\\n"
 
-
-            # 3) Persist and finish
-            analysis = "".join(full_text_parts).strip()
+            # 4) Persist and finish
+            final_text = "".join(full_text_parts).strip()
             try:
                 conn = get_connection(); cursor = conn.cursor()
                 cursor.execute("""
                     INSERT INTO clinical_analyses
                     (patient_name, specialty, note, analysis, status, created_at)
                     VALUES (%s,%s,%s,%s,'completed',CURRENT_TIMESTAMP)
-                """, (patient_name, specialty, note, analysis))
+                """, (patient_name, specialty, note, final_text))
                 conn.commit()
             except Exception as db_err:
-                yield f"event: warn\ndata:{json.dumps(f'DB save warning: {db_err}')}\n\n"
+                app.logger.warning(f"DB save warning: {db_err}")
+                if SSE_VERBOSE:
+                    yield f"event: warn\ndata:{json.dumps(f'DB save warning: {db_err}')}\\n\\n"
             finally:
                 try: cursor.close(); conn.close()
                 except Exception: pass
 
-            yield f"event: done\ndata:{json.dumps({'status':'done','detected_conditions': detected})}\n\n"
+            yield f"event: done\ndata:{json.dumps({'status':'done','detected_conditions': detected})}\\n\\n"
 
         headers = {
             "Content-Type": "text/event-stream",
@@ -585,6 +591,7 @@ def analyze_stream():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 
 

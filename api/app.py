@@ -257,6 +257,18 @@ def _has_enough_sections(txt: str) -> bool:
     found = sum(1 for h in EXPECTED_H2 if h in txt)
     return found >= 8
 
+def detect_conditions(note: str):
+    """
+    Return a list of condition keys from GUIDANCE_DATA whose trigger
+    phrases appear in the note (case-insensitive).
+    """
+    text = (note or "").lower()
+    found = []
+    for cond, data in (GUIDANCE_DATA or {}).items():
+        triggers = data.get("triggers", [])
+        if any(t in text for t in triggers):
+            found.append(cond)
+    return found
 
 # ---------- Analysis logic ----------
 def run_fast_analysis(note: str, specialty: str):

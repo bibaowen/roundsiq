@@ -311,66 +311,11 @@ IMAGE METADATA:
 """.strip()
 
 # ---------- FAST triage (JSON) ----------
-def run_fast_analysis(note: str, specialty: str) -> str:
-    prompt = f"""
-Return JSON with these keys only:
-- differentials: top 3 (short phrases, ≤6 words)
-- initial_actions: up to 5 bullets (≤10 words each)
-- red_flags: up to 5 bullets (≤10 words each)
-
-Patient note:
-{note[:2000]}
-""".strip()
-
-    resp = fast_client.chat.completions.create(
-        model=FAST_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a concise clinical triage assistant. Respond with a single valid JSON object."
-            },
-            {"role": "user", "content": prompt},
-        ],
-        #temperature=0.2,
-        # ✅ pass only max_completion_tokens via extra_body for this SDK
-        extra_body={"max_completion_tokens": 350},
-        response_format={"type": "json_object"},
-    )
-    return (resp.choices[0].message.content or "").strip()
-
-# ---------- FULL analysis (rich 10-section write-up with repair) ----------
-def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenames_meta: list):
-    detected_conditions = detect_conditions(note)
-
-    prompt_text = build_prompt(
-        note=note,
-        specialty=specialty,
-        images_meta_text=", ".join(filenames_meta or []),
-        detected_conditions=detected_conditions,
-    )
-
-    # Vision content (text + optional images)
-    content_blocks = [{"type": "text", "text": prompt_text}]
-    for uri in images_data_uris or []:
-        content_blocks.append({"type": "image_url", "image_url": {"url": uri}})
-
-    # First attempt — no temperature; use max_completion_tokens via extra_body
-    resp = full_client.chat.completions.create(
-        model=FULL_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a medical expert that returns only a well-structured, comprehensive 10-section diagnostic analysis."
-            },
-            {"role": "user", "content": content_blocks},
-        ],
-        extra_body={"max_completion_tokens": 2800},
-    )
-    draft = (resp.choices[0].message.content or "").strip()
-
-    # Repair if the exact H2 headings aren’t present
-    if not _has_enough_sections(draft):
-        repair_prompt = f"""
+def _safe_repair_10_sections(draft: str) -> str:
+    """Try to rewrite any non-empty draft into the exact 10 H2 sections."""
+    if not draft or not draft.strip():
+        return ""
+    repair_prompt = f"""
 Rewrite the following draft into EXACTLY these 10 H2 sections (no extra sections,
 no intro/outro text). Use the headings verbatim:
 
@@ -380,20 +325,81 @@ Draft to rewrite:
 {draft}
 """.strip()
 
-        resp2 = full_client.chat.completions.create(
+    resp2 = full_client.chat.completions.create(
+        model=FULL_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "Rewrite strictly into the exact 10 requested H2 sections. Do not add other sections."
+            },
+            {"role": "user", "content": repair_prompt},
+        ],
+        # models like gpt-5 don’t accept temperature; only pass token limit
+        extra_body={"max_completion_tokens": 2200},
+    )
+    return (resp2.choices[0].message.content or "").strip()
+
+
+def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenames_meta: list):
+    """
+    Full rich 10-section report with robust fallbacks so we never try to repair an empty draft.
+    """
+    detected_conditions = detect_conditions(note)
+
+    # Keep images as metadata text for chat.completions compatibility
+    prompt_text = build_prompt(
+        note=note,
+        specialty=specialty,
+        images_meta_text=", ".join(filenames_meta or []),
+        detected_conditions=detected_conditions,
+    )
+
+    # --- First attempt (text-only content) ---
+    resp = full_client.chat.completions.create(
+        model=FULL_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a medical expert that returns only a well-structured, comprehensive 10-section diagnostic analysis."
+            },
+            {"role": "user", "content": prompt_text},
+        ],
+        # no temperature (some models reject non-default)
+        extra_body={"max_completion_tokens": 2800},
+    )
+    draft = (resp.choices[0].message.content or "").strip()
+
+    # --- If empty, retry once with a slightly more direct instruction ---
+    if not draft:
+        retry_prompt = (
+            prompt_text
+            + "\n\nWrite the full report now using the exact 10 H2 headings above. "
+              "Do not add any other sections, prefaces, or appendices."
+        )
+        resp_retry = full_client.chat.completions.create(
             model=FULL_MODEL,
             messages=[
                 {
                     "role": "system",
-                    "content": "Rewrite strictly into the exact 10 requested H2 sections. Do not add other sections."
+                    "content": "You are a medical expert that returns only a well-structured, comprehensive 10-section diagnostic analysis."
                 },
-                {"role": "user", "content": repair_prompt},
+                {"role": "user", "content": retry_prompt},
             ],
-            extra_body={"max_completion_tokens": 2200},
+            extra_body={"max_completion_tokens": 2800},
         )
-        final_text = (resp2.choices[0].message.content or "").strip()
-        if _has_enough_sections(final_text):
-            draft = final_text
+        draft = (resp_retry.choices[0].message.content or "").strip()
+
+    # --- If still empty, return a scaffold (prevents ‘no draft provided’ on repair) ---
+    if not draft:
+        scaffold = "\n\n".join(f"{h}\nN/A — content unavailable after two attempts."
+                               for h in EXPECTED_H2)
+        return scaffold, detected_conditions
+
+    # --- If headings are incomplete but we DO have content, attempt repair once ---
+    if not _has_enough_sections(draft):
+        repaired = _safe_repair_10_sections(draft)
+        if repaired and _has_enough_sections(repaired):
+            draft = repaired
 
     return draft, detected_conditions
 

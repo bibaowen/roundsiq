@@ -562,6 +562,61 @@ def get_analysis():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ---------- FAST triage (JSON) ----------
+def run_fast_analysis(note: str, specialty: str) -> str:
+    """
+    Produce a tiny JSON triage summary. Returns a JSON string.
+    Uses only params supported by recent chat.completions models.
+    """
+    prompt = f"""
+Return JSON with these keys only:
+- differentials: top 3 (short phrases, ≤6 words)
+- initial_actions: up to 5 bullets (≤10 words each)
+- red_flags: up to 5 bullets (≤10 words each)
+
+Patient note:
+{note[:2000]}
+""".strip()
+
+    try:
+        resp = fast_client.chat.completions.create(
+            model=FAST_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a concise clinical triage assistant. Respond with a single valid JSON object."
+                },
+                {"role": "user", "content": prompt},
+            ],
+            # Some models reject non-default temperature; omit it.
+            # Token limit must be passed via extra_body to avoid 400s.
+            extra_body={
+                "max_completion_tokens": 350,
+                "response_format": {"type": "json_object"}
+            },
+        )
+        txt = (resp.choices[0].message.content or "").strip()
+        # Ensure it's valid JSON; if not, wrap a fallback.
+        try:
+            json.loads(txt)
+            return txt
+        except Exception:
+            return json.dumps({
+                "differentials": [],
+                "initial_actions": [],
+                "red_flags": [],
+                "note": "Model returned non-JSON; showing empty triage."
+            })
+    except Exception as e:
+        # Never raise to the worker—return a tiny fallback object
+        return json.dumps({
+            "differentials": [],
+            "initial_actions": [],
+            "red_flags": [],
+            "note": f"FAST triage error: {str(e)[:120]}"
+        })
+
+
 # ---------- Background worker ----------
 def process_pending_jobs():
     ensure_columns()

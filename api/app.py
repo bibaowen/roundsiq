@@ -321,15 +321,12 @@ Return JSON with these keys only:
 Patient note:
 {note[:2000]}
 """.strip()
-
+    
     resp = fast_client.chat.completions.create(
         model=FAST_MODEL,
-        messages=[
-            {"role": "system", "content": "You are a concise clinical triage assistant."},
-            {"role": "user", "content": prompt},
-        ],
+        messages=[ ... ],
         temperature=0.2,
-        max_tokens=350,
+        max_completion_tokens=350,         # ← was max_tokens
         response_format={"type": "json_object"},
     )
     return (resp.choices[0].message.content or "").strip()
@@ -350,16 +347,12 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
     for uri in images_data_uris or []:
         content_blocks.append({"type": "image_url", "image_url": {"url": uri}})
 
-    # First attempt
     resp = full_client.chat.completions.create(
-        model=FULL_MODEL,  # e.g., "gpt-5"
-        messages=[
-            {"role": "system", "content": "You are a medical expert that returns only a well-structured, comprehensive 10-section diagnostic analysis."},
-            {"role": "user", "content": content_blocks},
-        ],
+        model=FULL_MODEL,
+        messages=[ ... ],
         temperature=0.2,
-        max_tokens=2800,   # give the model enough room
-    )
+        max_completion_tokens=2800,        # ← was max_tokens
+)
     draft = (resp.choices[0].message.content or "").strip()
 
     # Repair to enforce the exact 10 headings if needed
@@ -373,15 +366,11 @@ no intro/outro text). Use the headings verbatim:
 Draft to rewrite:
 {draft}
 """.strip()
-
         resp2 = full_client.chat.completions.create(
             model=FULL_MODEL,
-            messages=[
-                {"role": "system", "content": "Rewrite strictly into the exact 10 requested H2 sections. Do not add other sections."},
-                {"role": "user", "content": repair_prompt},
-            ],
+            messages=[ ... ],
             temperature=0.1,
-            max_tokens=2200,
+            max_completion_tokens=2200,        # ← was max_tokens
         )
         final_text = (resp2.choices[0].message.content or "").strip()
         if _has_enough_sections(final_text):

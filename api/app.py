@@ -342,26 +342,18 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
         detected_conditions=detected_conditions,
     )
 
-    # resp = full_client.chat.completions.create(
-    #     model=FULL_MODEL,
-    #     messages=[
-    #         {
-    #             "role": "system",
-    #             "content": "You are a medical expert that returns only a well-structured, comprehensive 10-section diagnostic analysis."
-    #         },
-    #         {"role": "user", "content": prompt_text},
-    #     ],
-    #     extra_body={"max_completion_tokens": 2200},
-    # )
-    # draft = (resp.choices[0].message.content or "").strip()
-
     resp = full_client.chat.completions.create(
         model=FULL_MODEL,
-        messages=messages,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a medical expert that returns only a well-structured, comprehensive 10-section diagnostic analysis."
+            },
+            {"role": "user", "content": prompt_text},
+        ],
         extra_body={"max_completion_tokens": 2200},
-)
-    analysis = resp.choices[0].message.content.strip()  # Get the full response here
-
+    )
+    draft = (resp.choices[0].message.content or "").strip()
 
     if not draft:
         retry_prompt = (

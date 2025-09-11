@@ -448,7 +448,7 @@ def analyze():
         return jsonify({"error": str(e)}), 500
 
 # ---- True streaming (SSE) ----
-@app.route('/analyze_stream', methods=['POST'])
+@app.route('/analyze_stream', methods=['POST', 'GET', 'OPTIONS'])
 def analyze_stream():
     """
     Streams tokens via Server-Sent Events (SSE).

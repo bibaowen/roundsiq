@@ -256,7 +256,7 @@ def _has_enough_sections(txt: str) -> bool:
     # require at least 8/10 H2 headers to be safe
     found = sum(1 for h in EXPECTED_H2 if h in txt)
     return found >= 8
-
+# ---------- Condition detector (used by full pass) ----------
 def detect_conditions(note: str):
     """
     Return a list of condition keys from GUIDANCE_DATA whose trigger
@@ -270,28 +270,40 @@ def detect_conditions(note: str):
             found.append(cond)
     return found
 
-# ---------- Analysis logic ----------
-def run_fast_analysis(note: str, specialty: str):
-    prompt = f"""
-Return JSON with these keys only:
-- differentials: top 3 (<= 6 words each)
-- initial_actions: up to 5 bullets (<= 10 words each)
-- red_flags: up to 5 bullets (<= 10 words each)
 
-Patient note:
-{note[:2000]}
-"""
-    resp = fast_client.chat.completions.create(
-        model=FAST_MODEL,  # gpt-4o-mini by default
+# ---------- Full analysis (rich 10-section report) ----------
+def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenames_meta: list):
+    """
+    Calls the full model to produce the detailed 10-section report.
+    Returns (full_response_text, detected_conditions_list).
+    """
+    detected_conditions = detect_conditions(note)
+
+    prompt_text = build_prompt(
+        note=note,
+        specialty=specialty,
+        images_meta_text=", ".join(filenames_meta),
+        detected_conditions=detected_conditions
+    )
+
+    # Vision content blocks (text + zero or more images)
+    content_blocks = [{"type": "text", "text": prompt_text}]
+    for uri in images_data_uris or []:
+        content_blocks.append({"type": "image_url", "image_url": {"url": uri}})
+
+    resp = client.chat.completions.create(
+        model=os.getenv("FULL_MODEL", "gpt-5"),  # keep it on the rich model
         messages=[
-            {"role": "system", "content": "You are a concise clinical triage assistant."},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": "You are a medical expert that returns only a well-structured, comprehensive 10-section diagnostic analysis."},
+            {"role": "user", "content": content_blocks}
         ],
         temperature=0.2,
-        max_tokens=350,
-        response_format={"type": "json_object"},
+        # give enough room so it doesn't truncate the long write-up
+        max_tokens=2200,
     )
-    return resp.choices[0].message.content
+    full_response = (resp.choices[0].message.content or "").strip()
+    return full_response, detected_conditions
+
 
 # ---------- Routes ----------
 @app.route('/')

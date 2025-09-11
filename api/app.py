@@ -448,17 +448,25 @@ def analyze():
         return jsonify({"error": str(e)}), 500
 
 # ---- True streaming (SSE) ----
+# before:
+# @app.route('/analyze_stream', methods=['POST'])
+# after:
 @app.route('/analyze_stream', methods=['POST', 'GET', 'OPTIONS'])
 def analyze_stream():
-    """
-    Streams tokens via Server-Sent Events (SSE).
-    Recommended to POST JSON: {note, specialty}
-    """
     try:
-        # JSON body only for streaming (simpler). If you need multipart later, it’s easy to extend.
-        data = request.get_json(silent=True) or {}
-        note = (data.get("note") or "").strip()
-        specialty = data.get("specialty", "general")
+        if request.method == 'OPTIONS':
+            # CORS preflight ok
+            return ('', 204)
+
+        if request.method == 'GET':
+            # EventSource GET support (note in query string)
+            note = (request.args.get("note") or "").strip()
+            specialty = request.args.get("specialty", "general")
+        else:
+            data = request.get_json(silent=True) or {}
+            note = (data.get("note") or "").strip()
+            specialty = data.get("specialty", "general")
+
         if not note:
             return jsonify({"error": "Missing clinical note"}), 400
 
@@ -472,9 +480,7 @@ def analyze_stream():
 
         def generate():
             full_text_parts = []
-            # tell browsers to retry quickly if the connection drops
             yield "retry: 500\n\n"
-
             with full_client.chat.completions.stream(
                 model=FULL_MODEL,
                 messages=messages,
@@ -484,104 +490,42 @@ def analyze_stream():
                     if event.type == "token":
                         token = event.delta or ""
                         full_text_parts.append(token)
-                        # SSE frame: event "token"
                         yield f"event: token\ndata:{json.dumps(token)}\n\n"
                     elif event.type == "error":
                         yield f"event: error\ndata:{json.dumps(str(event.error))}\n\n"
 
             analysis = "".join(full_text_parts).strip()
-
-            # Save to DB after streaming finishes (does not block first tokens)
             try:
-                conn = get_connection()
-                cursor = conn.cursor()
-                cursor.execute("""
+                conn = get_connection(); cur = conn.cursor()
+                cur.execute("""
                     INSERT INTO clinical_analyses
-                        (patient_name, specialty, note, analysis, status, created_at)
+                    (patient_name, specialty, note, analysis, status, created_at)
                     VALUES (%s,%s,%s,%s,'completed',CURRENT_TIMESTAMP)
                 """, (patient_name, specialty, note, analysis))
                 conn.commit()
             except Exception as db_err:
                 yield f"event: warn\ndata:{json.dumps(f'DB save warning: {db_err}')}\n\n"
             finally:
-                try:
-                    cursor.close(); conn.close()
-                except:
-                    pass
+                try: cur.close(); conn.close()
+                except: pass
 
-            # final event
             yield f"event: done\ndata:{json.dumps({'status':'done','detected_conditions': detected})}\n\n"
 
         headers = {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",   # disable proxy buffering (Nginx)
+            "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
+            # CORS (optional)
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
         }
         return Response(stream_with_context(generate()), headers=headers)
-
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-# ---- Async queue endpoint ----
-@app.route('/queue_analysis', methods=['POST'])
-def queue_analysis():
-    """
-    Accepts JSON or multipart (note, specialty, optional images[]).
-    Stores a pending job so the worker can process it in background.
-    """
-    try:
-        images_data_uris, filenames_meta = [], []
-        note = ''
-        specialty = 'general'
-        doctor_id = None
-        mode = 'full'
-
-        if request.files:
-            note = (request.form.get("note") or "").strip()
-            specialty = request.form.get("specialty", "general")
-            doctor_id = request.form.get("doctor_id")
-            m = (request.form.get("mode") or "full").lower()
-            mode = m if m in ("fast","full") else "full"
-            for idx, f in enumerate(request.files.getlist("images")):
-                if idx >= MAX_IMAGES or not file_ok(f.filename):
-                    continue
-                try:
-                    png_bytes, kind = image_file_to_png_bytes(f)
-                    images_data_uris.append(b64_data_uri(png_bytes))
-                    filenames_meta.append(f"{f.filename} ({kind})")
-                except Exception as ex:
-                    filenames_meta.append(f"{f.filename} (error: {ex})")
-        else:
-            data = request.get_json(silent=True) or {}
-            note = (data.get("note") or "").strip()
-            specialty = data.get("specialty", "general")
-            doctor_id = data.get("doctor_id")
-            m = (data.get("mode") or "full").lower()
-            mode = m if m in ("fast","full") else "full"
-
-        if not note:
-            return jsonify({"error": "Missing clinical note"}), 400
-
-        patient_name = note.split(",")[0].strip() if "," in note else "Unknown"
-
-        ensure_columns()
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO clinical_analyses (doctor_id, patient_name, specialty, note, status, images_json, mode, created_at)
-            VALUES (%s, %s, %s, %s, 'pending', %s, %s, CURRENT_TIMESTAMP)
-        """, (doctor_id, patient_name, specialty, note, json.dumps(images_data_uris or []), mode))
-        analysis_id = cursor.lastrowid
-        conn.commit()
-        cursor.close(); conn.close()
-
-        return jsonify({"analysis_id": analysis_id, "status": "pending"})
-
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
 
 # ---- Async status fetch ----
 @app.route('/get_analysis', methods=['GET'])

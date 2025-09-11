@@ -322,7 +322,7 @@ Draft to rewrite:
 
     resp2 = full_client.chat.completions.create(
         model=FULL_MODEL,
-        messages=[
+        messages=[ 
             {
                 "role": "system",
                 "content": "Rewrite strictly into the exact 10 requested H2 sections. Do not add other sections."
@@ -386,7 +386,7 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
 
     return draft, detected_conditions
 
-# ---------- Routes ----------
+# ---------- Routes ---------- 
 @app.route('/')
 def home():
     return "✅ RoundsIQ with history & comparison dashboard (MySQL) is running."
@@ -448,9 +448,6 @@ def analyze():
         return jsonify({"error": str(e)}), 500
 
 # ---- True streaming (SSE) ----
-# before:
-# @app.route('/analyze_stream', methods=['POST'])
-# after:
 @app.route('/analyze_stream', methods=['POST', 'GET', 'OPTIONS'])
 def analyze_stream():
     try:
@@ -480,24 +477,41 @@ def analyze_stream():
 
         def generate():
             full_text_parts = []
-            yield "retry: 500\n\n"
-            with full_client.chat.completions.stream(
+            # Optional SSE retry header:
+            # yield "retry: 500\n\n"
+
+            resp = full_client.chat.completions.create(
                 model=FULL_MODEL,
                 messages=messages,
+                stream=True,  # <-- classic streaming
                 extra_body={"max_completion_tokens": 2000},
-            ) as stream:
-                for event in stream:
-                    if event.type == "token":
-                        token = event.delta or ""
-                        full_text_parts.append(token)
-                        yield f"event: token\ndata:{json.dumps(token)}\n\n"
-                    elif event.type == "error":
-                        yield f"event: error\ndata:{json.dumps(str(event.error))}\n\n"
+            )
+
+            for chunk in resp:
+                try:
+                    choice = chunk.choices[0]
+                except Exception:
+                    continue
+
+                # In streamed chunks, content arrives in .delta.content
+                delta = getattr(choice, "delta", None)
+                token = ""
+                if delta is not None:
+                    token = delta.content or ""
+                else:
+                    # Fallback for any older shapes
+                    token = getattr(choice, "text", "") or ""
+
+                if token:
+                    full_text_parts.append(token)
+                    # SSE frame
+                    yield f"event: token\ndata:{json.dumps(token)}\n\n"
 
             analysis = "".join(full_text_parts).strip()
+
             try:
-                conn = get_connection(); cur = conn.cursor()
-                cur.execute("""
+                conn = get_connection(); cursor = conn.cursor()
+                cursor.execute("""
                     INSERT INTO clinical_analyses
                     (patient_name, specialty, note, analysis, status, created_at)
                     VALUES (%s,%s,%s,%s,'completed',CURRENT_TIMESTAMP)
@@ -506,7 +520,7 @@ def analyze_stream():
             except Exception as db_err:
                 yield f"event: warn\ndata:{json.dumps(f'DB save warning: {db_err}')}\n\n"
             finally:
-                try: cur.close(); conn.close()
+                try: cursor.close(); conn.close()
                 except: pass
 
             yield f"event: done\ndata:{json.dumps({'status':'done','detected_conditions': detected})}\n\n"
@@ -526,291 +540,6 @@ def analyze_stream():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-
-# ---- Async status fetch ----
-@app.route('/get_analysis', methods=['GET'])
-def get_analysis():
-    analysis_id = request.args.get("id")
-    if not analysis_id:
-        return jsonify({"error": "Missing analysis ID"}), 400
-    try:
-        ensure_columns()
-        conn = get_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT id, patient_name, specialty, note, analysis, status, images_json,
-                   detected_conditions, mode, upgrade_to_id, error_message, created_at, updated_at
-            FROM clinical_analyses WHERE id = %s
-        """, (analysis_id,))
-        record = cursor.fetchone()
-        cursor.close(); conn.close()
-        if not record:
-            return jsonify({"error": "Analysis not found"}), 404
-
-        try:
-            record["images_json"] = json.loads(record["images_json"]) if record["images_json"] else []
-        except Exception:
-            record["images_json"] = []
-        try:
-            record["detected_conditions"] = json.loads(record["detected_conditions"]) if record["detected_conditions"] else []
-        except Exception:
-            record["detected_conditions"] = []
-
-        return jsonify(record)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ---------- FAST triage (JSON) ----------
-def run_fast_analysis(note: str, specialty: str) -> str:
-    prompt = f"""
-Return JSON with these keys only:
-- differentials: top 3 (short phrases, ≤6 words)
-- initial_actions: up to 5 bullets (≤10 words each)
-- red_flags: up to 5 bullets (≤10 words each)
-
-Patient note:
-{note[:2000]}
-""".strip()
-
-    try:
-        resp = fast_client.chat.completions.create(
-            model=FAST_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a concise clinical triage assistant. Respond with a single valid JSON object."
-                },
-                {"role": "user", "content": prompt},
-            ],
-            extra_body={
-                "max_completion_tokens": 350,
-                "response_format": {"type": "json_object"}
-            },
-        )
-        txt = (resp.choices[0].message.content or "").strip()
-        try:
-            json.loads(txt)
-            return txt
-        except Exception:
-            return json.dumps({
-                "differentials": [],
-                "initial_actions": [],
-                "red_flags": [],
-                "note": "Model returned non-JSON; showing empty triage."
-            })
-    except Exception as e:
-        return json.dumps({
-            "differentials": [],
-            "initial_actions": [],
-            "red_flags": [],
-            "note": f"FAST triage error: {str(e)[:120]}"
-        })
-
-# ---------- Background worker ----------
-def process_pending_jobs():
-    ensure_columns()
-    last_beat = 0
-    while True:
-        try:
-            if time.time() - last_beat > 15:
-                print("[worker] heartbeat OK")
-                last_beat = time.time()
-
-            conn = get_connection()
-            conn.start_transaction()
-            cursor = conn.cursor(dictionary=True)
-
-            try:
-                cursor.execute("""
-                    SELECT id, doctor_id, patient_name, specialty, note, images_json, mode
-                    FROM clinical_analyses
-                    WHERE status = 'pending'
-                    ORDER BY created_at ASC
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                """)
-            except mysql.connector.errors.ProgrammingError:
-                cursor.execute("""
-                    SELECT id, doctor_id, patient_name, specialty, note, images_json, mode
-                    FROM clinical_analyses
-                    WHERE status = 'pending'
-                    ORDER BY created_at ASC
-                    LIMIT 1
-                    FOR UPDATE
-                """)
-
-            job = cursor.fetchone()
-            if job:
-                cursor.execute("""
-                    UPDATE clinical_analyses
-                    SET status = 'processing', updated_at = CURRENT_TIMESTAMP, error_message = NULL
-                    WHERE id = %s AND status = 'pending'
-                """, (job['id'],))
-            conn.commit()
-            cursor.close(); conn.close()
-
-            if not job:
-                time.sleep(0.25)
-                continue
-
-            print(f"[worker] Processing analysis {job['id']} (mode={job.get('mode','full')})...")
-
-            try:
-                images_data_uris = []
-                try:
-                    images_data_uris = json.loads(job.get("images_json") or "[]")
-                except Exception:
-                    pass
-                filenames_meta = [f"image_{i+1}.png (queued)" for i in range(len(images_data_uris))]
-                mode = (job.get('mode') or 'full').lower()
-
-                if mode == 'fast':
-                    analysis_result = run_fast_analysis(job['note'], job['specialty'])
-                    detected = []
-
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        INSERT INTO clinical_analyses
-                            (doctor_id, patient_name, specialty, note, status, images_json, mode, created_at)
-                        VALUES
-                            (%s, %s, %s, %s, 'pending', %s, 'full', CURRENT_TIMESTAMP)
-                    """, (job.get('doctor_id'), job['patient_name'], job['specialty'],
-                          job['note'], json.dumps(images_data_uris or [])))
-                    full_id = cursor.lastrowid
-
-                    cursor.execute("""
-                        UPDATE clinical_analyses
-                        SET analysis = %s,
-                            status = 'completed_fast',
-                            detected_conditions = %s,
-                            upgrade_to_id = %s,
-                            updated_at = CURRENT_TIMESTAMP,
-                            error_message = NULL
-                        WHERE id = %s
-                    """, (analysis_result, json.dumps(detected), full_id, job['id']))
-                    conn.commit()
-                    cursor.close(); conn.close()
-                    print(f"[worker] Fast pass completed for {job['id']} → full job {full_id}")
-
-                else:
-                    analysis_result, detected = run_gpt5_analysis(
-                        note=job['note'],
-                        specialty=job['specialty'],
-                        images_data_uris=images_data_uris,
-                        filenames_meta=filenames_meta
-                    )
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        UPDATE clinical_analyses
-                        SET analysis = %s,
-                            status = 'completed',
-                            detected_conditions = %s,
-                            updated_at = CURRENT_TIMESTAMP,
-                            error_message = NULL
-                        WHERE id = %s
-                    """, (analysis_result, json.dumps(detected), job['id']))
-                    conn.commit()
-                    cursor.close(); conn.close()
-                    print(f"[worker] Full analysis completed for {job['id']}")
-
-            except Exception as proc_err:
-                err_text = f"{type(proc_err).__name__}: {proc_err}"
-                print(f"[worker] FAILED analysis {job['id']}: {err_text}")
-                try:
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        UPDATE clinical_analyses
-                        SET status = 'failed',
-                            updated_at = CURRENT_TIMESTAMP,
-                            error_message = %s
-                        WHERE id = %s
-                    """, (err_text, job['id']))
-                    conn.commit()
-                    cursor.close(); conn.close()
-                except Exception as mark_err:
-                    print("[worker] also failed to mark row as failed:", mark_err)
-
-        except Exception as loop_err:
-            print("[worker] loop error:", loop_err)
-            time.sleep(2)
-
-@app.route('/health')
-def health():
-    return jsonify({"ok": True})
-
-# ---------- History / Compare ----------
-@app.route('/history', methods=['GET'])
-def history():
-    patient_name = request.args.get("patient_name", "").strip()
-    if not patient_name:
-        return jsonify({"error": "Missing patient_name"}), 400
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT id, patient_name, specialty, created_at, status
-            FROM clinical_analyses
-            WHERE patient_name = %s
-            ORDER BY created_at DESC
-        """, (patient_name,))
-        rows = cursor.fetchall()
-        cursor.close(); conn.close()
-        return jsonify([
-            {
-                "id": r["id"],
-                "patient_name": r["patient_name"],
-                "specialty": r["specialty"],
-                "status": r.get("status", "completed"),
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None
-            } for r in rows
-        ])
-    except Exception as e:
-        return jsonify({"error": f"DB error: {str(e)}"}), 500
-
-@app.route('/worker_stats')
-def worker_stats():
-    try:
-        conn = get_connection()
-        cur = conn.cursor(dictionary=True)
-        cur.execute("SELECT COUNT(*) AS c FROM clinical_analyses WHERE status='pending'")
-        pending = cur.fetchone()['c']
-        cur.execute("SELECT COUNT(*) AS c FROM clinical_analyses WHERE status='processing'")
-        processing = cur.fetchone()['c']
-        cur.execute("SELECT COUNT(*) AS c FROM clinical_analyses WHERE status='failed'")
-        failed = cur.fetchone()['c']
-        cur.close(); conn.close()
-        return jsonify({"pending": pending, "processing": processing, "failed": failed})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/compare', methods=['GET'])
-def compare():
-    id1 = request.args.get("id1")
-    id2 = request.args.get("id2")
-    render = request.args.get("render", "html")
-    if not id1 or not id2:
-        return jsonify({"error": "Missing id1 or id2"}), 400
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""SELECT id, patient_name, specialty, note, analysis, created_at
-                          FROM clinical_analyses WHERE id = %s""", (id1,))
-        record1 = cursor.fetchone()
-        cursor.execute("""SELECT id, patient_name, specialty, note, analysis, created_at
-                          FROM clinical_analyses WHERE id = %s""", (id2,))
-        record2 = cursor.fetchone()
-        cursor.close(); conn.close()
-        if not record1 or not record2:
-            return jsonify({"error": "One or both records not found"}), 404
-        if render == "json":
-            return jsonify({"comparison": [record1, record2]})
-        else:
-            return render_template_string(HTML_TEMPLATE, record1=record1, record2=record2)
-    except Exception as e:
-        return jsonify({"error": f"DB compare error: {str(e)}"}), 500
 
 if __name__ == '__main__':
     threading.Thread(target=process_pending_jobs, daemon=True).start()

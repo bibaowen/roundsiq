@@ -325,15 +325,19 @@ Patient note:
     resp = fast_client.chat.completions.create(
         model=FAST_MODEL,
         messages=[
-            {"role": "system", "content": "You are a concise clinical triage assistant. Respond with a single valid JSON object."},
+            {
+                "role": "system",
+                "content": "You are a concise clinical triage assistant. Respond with a single valid JSON object."
+            },
             {"role": "user", "content": prompt},
         ],
         temperature=0.2,
-        # your SDK doesn’t accept max_completion_tokens as a top-level kwarg
-        extra_body={"max_completion_tokens": 350, "max_output_tokens": 350},
+        # ✅ pass only max_completion_tokens via extra_body for this SDK
+        extra_body={"max_completion_tokens": 350},
         response_format={"type": "json_object"},
     )
     return (resp.choices[0].message.content or "").strip()
+
 
 
 # ---------- FULL analysis (rich 10-section write-up with repair) ----------
@@ -356,11 +360,14 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
     resp = full_client.chat.completions.create(
         model=FULL_MODEL,  # e.g., "gpt-5"
         messages=[
-            {"role": "system", "content": "You are a medical expert that returns only a well-structured, comprehensive 10-section diagnostic analysis."},
+            {
+                "role": "system",
+                "content": "You are a medical expert that returns only a well-structured, comprehensive 10-section diagnostic analysis."
+            },
             {"role": "user", "content": content_blocks},
         ],
         temperature=0.2,
-        extra_body={"max_completion_tokens": 2800, "max_output_tokens": 2800},
+        extra_body={"max_completion_tokens": 2800},
     )
     draft = (resp.choices[0].message.content or "").strip()
 
@@ -379,17 +386,21 @@ Draft to rewrite:
         resp2 = full_client.chat.completions.create(
             model=FULL_MODEL,
             messages=[
-                {"role": "system", "content": "Rewrite strictly into the exact 10 requested H2 sections. Do not add other sections."},
+                {
+                    "role": "system",
+                    "content": "Rewrite strictly into the exact 10 requested H2 sections. Do not add other sections."
+                },
                 {"role": "user", "content": repair_prompt},
             ],
             temperature=0.1,
-            extra_body={"max_completion_tokens": 2200, "max_output_tokens": 2200},
+            extra_body={"max_completion_tokens": 2200},
         )
         final_text = (resp2.choices[0].message.content or "").strip()
         if _has_enough_sections(final_text):
             draft = final_text
 
     return draft, detected_conditions
+
 
 
 # ---------- Routes ----------

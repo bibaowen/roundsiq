@@ -1,5 +1,5 @@
 from __future__ import annotations
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, Response, stream_with_context
 from dotenv import load_dotenv
 import os, io, base64, json, traceback, threading, time
 import mysql.connector
@@ -40,12 +40,13 @@ proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
 fast_timeout = httpx.Timeout(10.0, read=20.0, write=10.0, connect=10.0)
 full_timeout = httpx.Timeout(30.0, read=180.0, write=30.0, connect=15.0)  # longer read for full write-up
 
+# Use HTTP/2 for lower handshake latency + persistent connections
 if proxy:
-    fast_http = httpx.Client(proxies=proxy, timeout=fast_timeout)
-    full_http = httpx.Client(proxies=proxy, timeout=full_timeout)
+    fast_http = httpx.Client(proxies=proxy, timeout=fast_timeout, http2=True)
+    full_http = httpx.Client(proxies=proxy, timeout=full_timeout, http2=True)
 else:
-    fast_http = httpx.Client(timeout=fast_timeout)
-    full_http = httpx.Client(timeout=full_timeout)
+    fast_http = httpx.Client(timeout=fast_timeout, http2=True)
+    full_http = httpx.Client(timeout=full_timeout, http2=True)
 
 fast_client = OpenAI(api_key=OPENAI_API_KEY, http_client=fast_http)
 full_client = OpenAI(api_key=OPENAI_API_KEY, http_client=full_http)
@@ -242,12 +243,8 @@ GUIDANCE_DATA = {
             "prompt": "Generate a detailed inpatient management plan for DKA or HHS per ADA guidelines and hospital best practices. Include diagnostic criteria, stepwise fluid resuscitation plan (type, volume, and rate), insulin therapy with dosing and transition to subcutaneous insulin, electrolyte monitoring and replacement (potassium, phosphate), identification and treatment of precipitating factors, criteria for resolution, and patient education prior to discharge. Include CMS quality documentation requirements and references."}
 }
 
-# ---------- Condition detector (used by full pass) ----------
+# ---------- Condition detector ----------
 def detect_conditions(note: str):
-    """
-    Return a list of condition keys from GUIDANCE_DATA whose trigger
-    phrases appear in the note (case-insensitive).
-    """
     text = (note or "").lower()
     found = []
     for cond, data in (GUIDANCE_DATA or {}).items():
@@ -270,11 +267,10 @@ EXPECTED_H2 = [
 ]
 
 def _has_enough_sections(txt: str) -> bool:
-    # require at least 8/10 H2 headers to be safe
     found = sum(1 for h in EXPECTED_H2 if h in txt)
     return found >= 8
 
-# ---------- Prompt builder (enforces the 10 H2 sections) ----------
+# ---------- Prompt builder ----------
 def build_prompt(note: str, specialty: str, images_meta_text: str, detected_conditions):
     modifier = get_prompt_modifier(specialty) or ""
     extra_guidance = ""
@@ -312,7 +308,6 @@ IMAGE METADATA:
 
 # ---------- FAST triage (JSON) ----------
 def _safe_repair_10_sections(draft: str) -> str:
-    """Try to rewrite any non-empty draft into the exact 10 H2 sections."""
     if not draft or not draft.strip():
         return ""
     repair_prompt = f"""
@@ -334,19 +329,12 @@ Draft to rewrite:
             },
             {"role": "user", "content": repair_prompt},
         ],
-        # models like gpt-5 don’t accept temperature; only pass token limit
         extra_body={"max_completion_tokens": 2200},
     )
     return (resp2.choices[0].message.content or "").strip()
 
-
 def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenames_meta: list):
-    """
-    Full rich 10-section report with robust fallbacks so we never try to repair an empty draft.
-    """
     detected_conditions = detect_conditions(note)
-
-    # Keep images as metadata text for chat.completions compatibility
     prompt_text = build_prompt(
         note=note,
         specialty=specialty,
@@ -354,7 +342,6 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
         detected_conditions=detected_conditions,
     )
 
-    # --- First attempt (text-only content) ---
     resp = full_client.chat.completions.create(
         model=FULL_MODEL,
         messages=[
@@ -364,12 +351,10 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
             },
             {"role": "user", "content": prompt_text},
         ],
-        # no temperature (some models reject non-default)
-        extra_body={"max_completion_tokens": 2800},
+        extra_body={"max_completion_tokens": 2200},
     )
     draft = (resp.choices[0].message.content or "").strip()
 
-    # --- If empty, retry once with a slightly more direct instruction ---
     if not draft:
         retry_prompt = (
             prompt_text
@@ -385,25 +370,21 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
                 },
                 {"role": "user", "content": retry_prompt},
             ],
-            extra_body={"max_completion_tokens": 2800},
+            extra_body={"max_completion_tokens": 2200},
         )
         draft = (resp_retry.choices[0].message.content or "").strip()
 
-    # --- If still empty, return a scaffold (prevents ‘no draft provided’ on repair) ---
     if not draft:
         scaffold = "\n\n".join(f"{h}\nN/A — content unavailable after two attempts."
                                for h in EXPECTED_H2)
         return scaffold, detected_conditions
 
-    # --- If headings are incomplete but we DO have content, attempt repair once ---
     if not _has_enough_sections(draft):
         repaired = _safe_repair_10_sections(draft)
         if repaired and _has_enough_sections(repaired):
             draft = repaired
 
     return draft, detected_conditions
-
-
 
 # ---------- Routes ----------
 @app.route('/')
@@ -418,7 +399,6 @@ def analyze():
         note = ''
         specialty = 'general'
 
-        # Handle form-data or JSON
         if request.files:
             note = (request.form.get("note") or "").strip()
             specialty = request.form.get("specialty", "general")
@@ -441,10 +421,8 @@ def analyze():
 
         patient_name = note.split(",")[0].strip() if "," in note else "Unknown"
 
-        # Run FULL (blocking)
         analysis, detected = run_gpt5_analysis(note, specialty, images_data_uris, filenames_meta)
 
-        # Save to DB
         try:
             conn = get_connection()
             cursor = conn.cursor()
@@ -464,6 +442,83 @@ def analyze():
             "summary": f"Processed {len(images_data_uris)} image(s).",
             "detected_conditions": detected
         })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+# ---- True streaming (SSE) ----
+@app.route('/analyze_stream', methods=['POST'])
+def analyze_stream():
+    """
+    Streams tokens via Server-Sent Events (SSE).
+    Recommended to POST JSON: {note, specialty}
+    """
+    try:
+        # JSON body only for streaming (simpler). If you need multipart later, it’s easy to extend.
+        data = request.get_json(silent=True) or {}
+        note = (data.get("note") or "").strip()
+        specialty = data.get("specialty", "general")
+        if not note:
+            return jsonify({"error": "Missing clinical note"}), 400
+
+        patient_name = note.split(",")[0].strip() if "," in note else "Unknown"
+        detected = detect_conditions(note)
+        prompt = build_prompt(note, specialty, "", detected)
+        messages = [
+            {"role": "system", "content": "You are a medical expert that returns only a well-structured, comprehensive 10-section diagnostic analysis."},
+            {"role": "user", "content": prompt},
+        ]
+
+        def generate():
+            full_text_parts = []
+            # tell browsers to retry quickly if the connection drops
+            yield "retry: 500\n\n"
+
+            with full_client.chat.completions.stream(
+                model=FULL_MODEL,
+                messages=messages,
+                extra_body={"max_completion_tokens": 2000},
+            ) as stream:
+                for event in stream:
+                    if event.type == "token":
+                        token = event.delta or ""
+                        full_text_parts.append(token)
+                        # SSE frame: event "token"
+                        yield f"event: token\ndata:{json.dumps(token)}\n\n"
+                    elif event.type == "error":
+                        yield f"event: error\ndata:{json.dumps(str(event.error))}\n\n"
+
+            analysis = "".join(full_text_parts).strip()
+
+            # Save to DB after streaming finishes (does not block first tokens)
+            try:
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO clinical_analyses
+                        (patient_name, specialty, note, analysis, status, created_at)
+                    VALUES (%s,%s,%s,%s,'completed',CURRENT_TIMESTAMP)
+                """, (patient_name, specialty, note, analysis))
+                conn.commit()
+            except Exception as db_err:
+                yield f"event: warn\ndata:{json.dumps(f'DB save warning: {db_err}')}\n\n"
+            finally:
+                try:
+                    cursor.close(); conn.close()
+                except:
+                    pass
+
+            # final event
+            yield f"event: done\ndata:{json.dumps({'status':'done','detected_conditions': detected})}\n\n"
+
+        headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable proxy buffering (Nginx)
+            "Connection": "keep-alive",
+        }
+        return Response(stream_with_context(generate()), headers=headers)
 
     except Exception as e:
         traceback.print_exc()
@@ -548,7 +603,6 @@ def get_analysis():
         if not record:
             return jsonify({"error": "Analysis not found"}), 404
 
-        # decode JSON columns for neatness
         try:
             record["images_json"] = json.loads(record["images_json"]) if record["images_json"] else []
         except Exception:
@@ -564,10 +618,6 @@ def get_analysis():
 
 # ---------- FAST triage (JSON) ----------
 def run_fast_analysis(note: str, specialty: str) -> str:
-    """
-    Produce a tiny JSON triage summary. Returns a JSON string.
-    Uses only params supported by recent chat.completions models.
-    """
     prompt = f"""
 Return JSON with these keys only:
 - differentials: top 3 (short phrases, ≤6 words)
@@ -588,15 +638,12 @@ Patient note:
                 },
                 {"role": "user", "content": prompt},
             ],
-            # Some models reject non-default temperature; omit it.
-            # Token limit must be passed via extra_body to avoid 400s.
             extra_body={
                 "max_completion_tokens": 350,
                 "response_format": {"type": "json_object"}
             },
         )
         txt = (resp.choices[0].message.content or "").strip()
-        # Ensure it's valid JSON; if not, wrap a fallback.
         try:
             json.loads(txt)
             return txt
@@ -608,14 +655,12 @@ Patient note:
                 "note": "Model returned non-JSON; showing empty triage."
             })
     except Exception as e:
-        # Never raise to the worker—return a tiny fallback object
         return json.dumps({
             "differentials": [],
             "initial_actions": [],
             "red_flags": [],
             "note": f"FAST triage error: {str(e)[:120]}"
         })
-
 
 # ---------- Background worker ----------
 def process_pending_jobs():
@@ -627,12 +672,10 @@ def process_pending_jobs():
                 print("[worker] heartbeat OK")
                 last_beat = time.time()
 
-            # --- claim one job atomically ---
             conn = get_connection()
-            conn.start_transaction()  # explicit TX
+            conn.start_transaction()
             cursor = conn.cursor(dictionary=True)
 
-            # Prefer SKIP LOCKED on MySQL 8.0+
             try:
                 cursor.execute("""
                     SELECT id, doctor_id, patient_name, specialty, note, images_json, mode
@@ -643,7 +686,6 @@ def process_pending_jobs():
                     FOR UPDATE SKIP LOCKED
                 """)
             except mysql.connector.errors.ProgrammingError:
-                # Fallback (no SKIP LOCKED)
                 cursor.execute("""
                     SELECT id, doctor_id, patient_name, specialty, note, images_json, mode
                     FROM clinical_analyses
@@ -664,12 +706,11 @@ def process_pending_jobs():
             cursor.close(); conn.close()
 
             if not job:
-                time.sleep(0.25)  # light idle
+                time.sleep(0.25)
                 continue
 
             print(f"[worker] Processing analysis {job['id']} (mode={job.get('mode','full')})...")
 
-            # --- do the work ---
             try:
                 images_data_uris = []
                 try:
@@ -677,15 +718,12 @@ def process_pending_jobs():
                 except Exception:
                     pass
                 filenames_meta = [f"image_{i+1}.png (queued)" for i in range(len(images_data_uris))]
-
                 mode = (job.get('mode') or 'full').lower()
 
                 if mode == 'fast':
-                    # 1) Fast triage
                     analysis_result = run_fast_analysis(job['note'], job['specialty'])
-                    detected = []  # skip heavy detection for fast pass
+                    detected = []
 
-                    # 2) Enqueue FULL follow-up job
                     conn = get_connection()
                     cursor = conn.cursor()
                     cursor.execute("""
@@ -697,7 +735,6 @@ def process_pending_jobs():
                           job['note'], json.dumps(images_data_uris or [])))
                     full_id = cursor.lastrowid
 
-                    # 3) Save fast result & pointer to upgrade
                     cursor.execute("""
                         UPDATE clinical_analyses
                         SET analysis = %s,
@@ -713,7 +750,6 @@ def process_pending_jobs():
                     print(f"[worker] Fast pass completed for {job['id']} → full job {full_id}")
 
                 else:
-                    # FULL analysis (long timeout + big token budget)
                     analysis_result, detected = run_gpt5_analysis(
                         note=job['note'],
                         specialty=job['specialty'],
@@ -760,9 +796,6 @@ def process_pending_jobs():
 @app.route('/health')
 def health():
     return jsonify({"ok": True})
-
-# Start worker thread
-#threading.Thread(target=process_pending_jobs, daemon=True).start()
 
 # ---------- History / Compare ----------
 @app.route('/history', methods=['GET'])

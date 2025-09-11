@@ -38,7 +38,7 @@ except Exception:
 proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
 
 fast_timeout = httpx.Timeout(10.0, read=20.0, write=10.0, connect=10.0)
-full_timeout = httpx.Timeout(30.0, read=180.0, write=30.0, connect=15.0)  # <-- longer read for full write-up
+full_timeout = httpx.Timeout(30.0, read=180.0, write=30.0, connect=15.0)  # longer read for full write-up
 
 if proxy:
     fast_http = httpx.Client(proxies=proxy, timeout=fast_timeout)
@@ -49,6 +49,9 @@ else:
 
 fast_client = OpenAI(api_key=OPENAI_API_KEY, http_client=fast_http)
 full_client = OpenAI(api_key=OPENAI_API_KEY, http_client=full_http)
+
+# Back-compat alias in case any path still references `client`
+client = full_client
 
 # ---------- Database settings ----------
 DB_HOST = os.getenv("DB_HOST")
@@ -239,6 +242,20 @@ GUIDANCE_DATA = {
             "prompt": "Generate a detailed inpatient management plan for DKA or HHS per ADA guidelines and hospital best practices. Include diagnostic criteria, stepwise fluid resuscitation plan (type, volume, and rate), insulin therapy with dosing and transition to subcutaneous insulin, electrolyte monitoring and replacement (potassium, phosphate), identification and treatment of precipitating factors, criteria for resolution, and patient education prior to discharge. Include CMS quality documentation requirements and references."}
 }
 
+# ---------- Condition detector (used by full pass) ----------
+def detect_conditions(note: str):
+    """
+    Return a list of condition keys from GUIDANCE_DATA whose trigger
+    phrases appear in the note (case-insensitive).
+    """
+    text = (note or "").lower()
+    found = []
+    for cond, data in (GUIDANCE_DATA or {}).items():
+        triggers = data.get("triggers", [])
+        if any(t in text for t in triggers):
+            found.append(cond)
+    return found
+
 EXPECTED_H2 = [
     "## 1. Differential Diagnosis",
     "## 2. Pathophysiology Integration",
@@ -267,7 +284,6 @@ def build_prompt(note: str, specialty: str, images_meta_text: str, detected_cond
             for cond in detected_conditions if cond in GUIDANCE_DATA
         )
 
-    # The exact headers we expect the model to output
     headings_block = "\n".join(EXPECTED_H2)
 
     return f"""
@@ -294,7 +310,6 @@ IMAGE METADATA:
 {images_meta_text if images_meta_text else 'No images attached.'}
 """.strip()
 
-
 # ---------- FAST triage (JSON) ----------
 def run_fast_analysis(note: str, specialty: str) -> str:
     prompt = f"""
@@ -318,7 +333,6 @@ Patient note:
         response_format={"type": "json_object"},
     )
     return (resp.choices[0].message.content or "").strip()
-
 
 # ---------- FULL analysis (rich 10-section write-up with repair) ----------
 def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenames_meta: list):
@@ -348,7 +362,7 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
     )
     draft = (resp.choices[0].message.content or "").strip()
 
-    # If the model didn't include enough of the exact headers, ask it to repair
+    # Repair to enforce the exact 10 headings if needed
     if not _has_enough_sections(draft):
         repair_prompt = f"""
 Rewrite the following draft into EXACTLY these 10 H2 sections (no extra sections,
@@ -371,59 +385,9 @@ Draft to rewrite:
         )
         final_text = (resp2.choices[0].message.content or "").strip()
         if _has_enough_sections(final_text):
-            draft = final_text  # use repaired version
+            draft = final_text
 
     return draft, detected_conditions
-
-
-# ---------- Condition detector (used by full pass) ----------
-def detect_conditions(note: str):
-    """
-    Return a list of condition keys from GUIDANCE_DATA whose trigger
-    phrases appear in the note (case-insensitive).
-    """
-    text = (note or "").lower()
-    found = []
-    for cond, data in (GUIDANCE_DATA or {}).items():
-        triggers = data.get("triggers", [])
-        if any(t in text for t in triggers):
-            found.append(cond)
-    return found
-
-
-# ---------- Full analysis (rich 10-section report) ----------
-def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenames_meta: list):
-    """
-    Calls the full model to produce the detailed 10-section report.
-    Returns (full_response_text, detected_conditions_list).
-    """
-    detected_conditions = detect_conditions(note)
-
-    prompt_text = build_prompt(
-        note=note,
-        specialty=specialty,
-        images_meta_text=", ".join(filenames_meta),
-        detected_conditions=detected_conditions
-    )
-
-    # Vision content blocks (text + zero or more images)
-    content_blocks = [{"type": "text", "text": prompt_text}]
-    for uri in images_data_uris or []:
-        content_blocks.append({"type": "image_url", "image_url": {"url": uri}})
-
-    resp = client.chat.completions.create(
-        model=os.getenv("FULL_MODEL", "gpt-5"),  # keep it on the rich model
-        messages=[
-            {"role": "system", "content": "You are a medical expert that returns only a well-structured, comprehensive 10-section diagnostic analysis."},
-            {"role": "user", "content": content_blocks}
-        ],
-        temperature=0.2,
-        # give enough room so it doesn't truncate the long write-up
-        max_tokens=2200,
-    )
-    full_response = (resp.choices[0].message.content or "").strip()
-    return full_response, detected_conditions
-
 
 # ---------- Routes ----------
 @app.route('/')

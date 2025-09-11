@@ -331,14 +331,12 @@ Patient note:
             },
             {"role": "user", "content": prompt},
         ],
-        temperature=0.2,
+        #temperature=0.2,
         # ✅ pass only max_completion_tokens via extra_body for this SDK
         extra_body={"max_completion_tokens": 350},
         response_format={"type": "json_object"},
     )
     return (resp.choices[0].message.content or "").strip()
-
-
 
 # ---------- FULL analysis (rich 10-section write-up with repair) ----------
 def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenames_meta: list):
@@ -356,9 +354,9 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
     for uri in images_data_uris or []:
         content_blocks.append({"type": "image_url", "image_url": {"url": uri}})
 
-    # First attempt
+    # First attempt — no temperature; use max_completion_tokens via extra_body
     resp = full_client.chat.completions.create(
-        model=FULL_MODEL,  # e.g., "gpt-5"
+        model=FULL_MODEL,
         messages=[
             {
                 "role": "system",
@@ -366,7 +364,6 @@ def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenam
             },
             {"role": "user", "content": content_blocks},
         ],
-        temperature=0.2,
         extra_body={"max_completion_tokens": 2800},
     )
     draft = (resp.choices[0].message.content or "").strip()
@@ -392,7 +389,6 @@ Draft to rewrite:
                 },
                 {"role": "user", "content": repair_prompt},
             ],
-            temperature=0.1,
             extra_body={"max_completion_tokens": 2200},
         )
         final_text = (resp2.choices[0].message.content or "").strip()

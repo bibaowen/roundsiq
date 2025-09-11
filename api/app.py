@@ -476,8 +476,9 @@ def analyze_stream():
 
         def generate():
             full_text_parts = []
+            emitted_any = False
 
-            # 1) Try true streaming first
+            # 1) Try true streaming
             try:
                 resp = full_client.chat.completions.create(
                     model=FULL_MODEL,
@@ -485,7 +486,6 @@ def analyze_stream():
                     stream=True,
                     extra_body={"max_completion_tokens": 2000},
                 )
-
                 for chunk in resp:
                     try:
                         choice = chunk.choices[0]
@@ -495,37 +495,23 @@ def analyze_stream():
                     delta = getattr(choice, "delta", None)
                     token = ""
                     if delta is not None:
-                        # SDK >=1.0: delta.content
                         token = getattr(delta, "content", "") or ""
                     else:
-                        # Very old shapes
                         token = getattr(choice, "text", "") or ""
 
                     if token:
                         full_text_parts.append(token)
+                        emitted_any = True
                         yield f"event: token\ndata:{json.dumps(token)}\n\n"
 
             except BadRequestError as e:
-                # 2) Fallback when streaming isn't allowed (org not verified)
-                warn = "Streaming disabled on this org. Falling back to non-streaming."
-                yield f"event: warn\ndata:{json.dumps(warn)}\n\n"
-
-                resp_full = full_client.chat.completions.create(
-                    model=FULL_MODEL,
-                    messages=messages,
-                    extra_body={"max_completion_tokens": 2200},
-                )
-                analysis = (resp_full.choices[0].message.content or "").strip()
-                if analysis:
-                    # send entire text as one "token" event so UI shows it
-                    yield f"event: token\ndata:{json.dumps(analysis)}\n\n"
-                    full_text_parts.append(analysis)
-                else:
-                    yield f"event: warn\ndata:{json.dumps('Model returned empty text')}\n\n"
-
+                # Org not verified for streaming, etc.
+                yield f"event: warn\ndata:{json.dumps('Streaming not available; falling back to full response.')}\n\n"
             except Exception as e:
-                # 3) Any other unexpected streaming error -> fallback to non-streaming once
                 yield f"event: warn\ndata:{json.dumps('Streaming error: ' + str(e))}\n\n"
+
+            # 2) Fallback if no tokens were emitted
+            if not emitted_any:
                 try:
                     resp_full = full_client.chat.completions.create(
                         model=FULL_MODEL,
@@ -534,12 +520,14 @@ def analyze_stream():
                     )
                     analysis = (resp_full.choices[0].message.content or "").strip()
                     if analysis:
-                        yield f"event: token\ndata:{json.dumps(analysis)}\n\n"
                         full_text_parts.append(analysis)
+                        yield f"event: token\ndata:{json.dumps(analysis)}\n\n"
+                    else:
+                        yield f"event: warn\ndata:{json.dumps('Model returned empty text')}\n\n"
                 except Exception as e2:
                     yield f"event: error\ndata:{json.dumps('Fallback error: ' + str(e2))}\n\n"
 
-            # persist whatever we have
+            # 3) Persist and finish
             analysis = "".join(full_text_parts).strip()
             try:
                 conn = get_connection(); cursor = conn.cursor()
@@ -553,7 +541,7 @@ def analyze_stream():
                 yield f"event: warn\ndata:{json.dumps(f'DB save warning: {db_err}')}\n\n"
             finally:
                 try: cursor.close(); conn.close()
-                except: pass
+                except Exception: pass
 
             yield f"event: done\ndata:{json.dumps({'status':'done','detected_conditions': detected})}\n\n"
 
@@ -571,6 +559,7 @@ def analyze_stream():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 
 if __name__ == '__main__':

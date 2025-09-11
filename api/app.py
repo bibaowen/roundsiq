@@ -15,10 +15,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing. Set it in .env or environment variables.")
 
-# Models / token budgets
-FAST_MODEL = os.getenv("FAST_MODEL", "gpt-4o-mini")  # fast lane model (short outputs)
-FULL_MODEL = os.getenv("FULL_MODEL", "gpt-5")        # detailed write-up model
-FULL_MAX_TOKENS = int(os.getenv("FULL_MAX_TOKENS", "3000"))
+# ---------- Models ----------
+FULL_MODEL = os.getenv("FULL_MODEL", "gpt-5")
+FAST_MODEL = os.getenv("FAST_MODEL", "gpt-4o-mini")  # keep FAST truly fast
 
 # ---------- Image handling dependencies ----------
 try:
@@ -38,11 +37,15 @@ except Exception:
 # ---------- OpenAI clients: FAST (short) and FULL (long) ----------
 proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
 
-FAST_TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=10.0, timeout=20.0)
-FULL_TIMEOUT = httpx.Timeout(connect=20.0, read=210.0, write=60.0, timeout=240.0)
+fast_timeout = httpx.Timeout(10.0, read=20.0, write=10.0, connect=10.0)
+full_timeout = httpx.Timeout(30.0, read=180.0, write=30.0, connect=15.0)  # <-- longer read for full write-up
 
-fast_http = httpx.Client(timeout=FAST_TIMEOUT, proxies=proxy) if proxy else httpx.Client(timeout=FAST_TIMEOUT)
-full_http = httpx.Client(timeout=FULL_TIMEOUT, proxies=proxy) if proxy else httpx.Client(timeout=FULL_TIMEOUT)
+if proxy:
+    fast_http = httpx.Client(proxies=proxy, timeout=fast_timeout)
+    full_http = httpx.Client(proxies=proxy, timeout=full_timeout)
+else:
+    fast_http = httpx.Client(timeout=fast_timeout)
+    full_http = httpx.Client(timeout=full_timeout)
 
 fast_client = OpenAI(api_key=OPENAI_API_KEY, http_client=fast_http)
 full_client = OpenAI(api_key=OPENAI_API_KEY, http_client=full_http)
@@ -256,69 +259,27 @@ def _has_enough_sections(txt: str) -> bool:
 
 
 # ---------- Analysis logic ----------
-def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenames_meta: list):
-    detected_conditions = detect_conditions(note)
-    prompt_text = build_prompt(
-        note=note,
-        specialty=specialty,
-        images_meta_text=", ".join(filenames_meta),
-        detected_conditions=detected_conditions
-    )
+def run_fast_analysis(note: str, specialty: str):
+    prompt = f"""
+Return JSON with these keys only:
+- differentials: top 3 (<= 6 words each)
+- initial_actions: up to 5 bullets (<= 10 words each)
+- red_flags: up to 5 bullets (<= 10 words each)
 
-    content_blocks = [{"type": "text", "text": prompt_text}]
-    for uri in images_data_uris:
-        content_blocks.append({"type": "image_url", "image_url": {"url": uri}})
-
-    # 1) Ask for the full 10-section document with generous token budget.
-    resp = full_client.chat.completions.create(
-        model=os.getenv("FULL_MODEL", "gpt-5"),
+Patient note:
+{note[:2000]}
+"""
+    resp = fast_client.chat.completions.create(
+        model=FAST_MODEL,  # gpt-4o-mini by default
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a medical expert. Output must be Markdown using EXACT H2 headings "
-                    "## 1. .. ## 10. as instructed. No preface or summary outside those sections."
-                ),
-            },
-            {"role": "user", "content": content_blocks},
+            {"role": "system", "content": "You are a concise clinical triage assistant."},
+            {"role": "user", "content": prompt},
         ],
         temperature=0.2,
-        max_tokens=int(os.getenv("FULL_MAX_TOKENS", "3000")),
-        top_p=0.9,
-        presence_penalty=0.0,
-        frequency_penalty=0.0,
+        max_tokens=350,
+        response_format={"type": "json_object"},
     )
-    text = (resp.choices[0].message.content or "").strip()
-
-    # 2) If the model drifted, repair by rewriting into the exact 10 H2 sections.
-    if not _has_enough_sections(text):
-        repair = full_client.chat.completions.create(
-            model=os.getenv("FULL_MODEL", "gpt-5"),
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Rewrite the user's analysis into EXACTLY the 10 required H2 sections. "
-                        "No extra headings, no preface. Preserve all clinical specificity."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "Here is the analysis that needs restructuring into the exact 10 sections:\n\n"
-                        f"{text}\n\n"
-                        "Return only the Markdown with the exact H2 headings and order previously specified."
-                    ),
-                },
-            ],
-            temperature=0.2,
-            max_tokens=int(os.getenv("FULL_MAX_TOKENS", "3000")),
-        )
-        fixed = (repair.choices[0].message.content or "").strip()
-        if _has_enough_sections(fixed):
-            text = fixed  # use repaired version
-
-    return text, detected_conditions
+    return resp.choices[0].message.content
 
 # ---------- Routes ----------
 @app.route('/')
@@ -455,7 +416,7 @@ def get_analysis():
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
             SELECT id, patient_name, specialty, note, analysis, status, images_json,
-                   detected_conditions, mode, upgrade_to_id, created_at, updated_at
+                   detected_conditions, mode, upgrade_to_id, error_message, created_at, updated_at
             FROM clinical_analyses WHERE id = %s
         """, (analysis_id,))
         record = cursor.fetchone()

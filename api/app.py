@@ -488,13 +488,8 @@ def analyze_stream():
                     model=FULL_MODEL,
                     messages=messages,
                     stream=True,
-                    extra_body={"max_completion_tokens": 2000},
+                    extra_body={"max_completion_tokens": 3200},
                 )
-
-                buf = []
-                last_flush = time.time()
-                FLUSH_SECS = 0.12  # Adjust the threshold for flushing text
-
                 for chunk in resp:
                     try:
                         choice = chunk.choices[0]

@@ -762,7 +762,7 @@ def health():
     return jsonify({"ok": True})
 
 # Start worker thread
-threading.Thread(target=process_pending_jobs, daemon=True).start()
+#threading.Thread(target=process_pending_jobs, daemon=True).start()
 
 # ---------- History / Compare ----------
 @app.route('/history', methods=['GET'])

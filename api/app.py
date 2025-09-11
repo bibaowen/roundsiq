@@ -8,6 +8,7 @@ from pathlib import Path
 from openai import OpenAI
 import httpx
 from flask_cors import CORS
+from openai import BadRequestError  
 
 # ---------- Load environment variables ----------
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
@@ -452,11 +453,9 @@ def analyze():
 def analyze_stream():
     try:
         if request.method == 'OPTIONS':
-            # CORS preflight ok
             return ('', 204)
 
         if request.method == 'GET':
-            # EventSource GET support (note in query string)
             note = (request.args.get("note") or "").strip()
             specialty = request.args.get("specialty", "general")
         else:
@@ -477,38 +476,71 @@ def analyze_stream():
 
         def generate():
             full_text_parts = []
-            # Optional SSE retry header:
-            # yield "retry: 500\n\n"
 
-            resp = full_client.chat.completions.create(
-                model=FULL_MODEL,
-                messages=messages,
-                stream=True,  # <-- classic streaming
-                extra_body={"max_completion_tokens": 2000},
-            )
+            # 1) Try true streaming first
+            try:
+                resp = full_client.chat.completions.create(
+                    model=FULL_MODEL,
+                    messages=messages,
+                    stream=True,
+                    extra_body={"max_completion_tokens": 2000},
+                )
 
-            for chunk in resp:
-                try:
-                    choice = chunk.choices[0]
-                except Exception:
-                    continue
+                for chunk in resp:
+                    try:
+                        choice = chunk.choices[0]
+                    except Exception:
+                        continue
 
-                # In streamed chunks, content arrives in .delta.content
-                delta = getattr(choice, "delta", None)
-                token = ""
-                if delta is not None:
-                    token = delta.content or ""
+                    delta = getattr(choice, "delta", None)
+                    token = ""
+                    if delta is not None:
+                        # SDK >=1.0: delta.content
+                        token = getattr(delta, "content", "") or ""
+                    else:
+                        # Very old shapes
+                        token = getattr(choice, "text", "") or ""
+
+                    if token:
+                        full_text_parts.append(token)
+                        yield f"event: token\ndata:{json.dumps(token)}\n\n"
+
+            except BadRequestError as e:
+                # 2) Fallback when streaming isn't allowed (org not verified)
+                warn = "Streaming disabled on this org. Falling back to non-streaming."
+                yield f"event: warn\ndata:{json.dumps(warn)}\n\n"
+
+                resp_full = full_client.chat.completions.create(
+                    model=FULL_MODEL,
+                    messages=messages,
+                    extra_body={"max_completion_tokens": 2200},
+                )
+                analysis = (resp_full.choices[0].message.content or "").strip()
+                if analysis:
+                    # send entire text as one "token" event so UI shows it
+                    yield f"event: token\ndata:{json.dumps(analysis)}\n\n"
+                    full_text_parts.append(analysis)
                 else:
-                    # Fallback for any older shapes
-                    token = getattr(choice, "text", "") or ""
+                    yield f"event: warn\ndata:{json.dumps('Model returned empty text')}\n\n"
 
-                if token:
-                    full_text_parts.append(token)
-                    # SSE frame
-                    yield f"event: token\ndata:{json.dumps(token)}\n\n"
+            except Exception as e:
+                # 3) Any other unexpected streaming error -> fallback to non-streaming once
+                yield f"event: warn\ndata:{json.dumps('Streaming error: ' + str(e))}\n\n"
+                try:
+                    resp_full = full_client.chat.completions.create(
+                        model=FULL_MODEL,
+                        messages=messages,
+                        extra_body={"max_completion_tokens": 2200},
+                    )
+                    analysis = (resp_full.choices[0].message.content or "").strip()
+                    if analysis:
+                        yield f"event: token\ndata:{json.dumps(analysis)}\n\n"
+                        full_text_parts.append(analysis)
+                except Exception as e2:
+                    yield f"event: error\ndata:{json.dumps('Fallback error: ' + str(e2))}\n\n"
 
+            # persist whatever we have
             analysis = "".join(full_text_parts).strip()
-
             try:
                 conn = get_connection(); cursor = conn.cursor()
                 cursor.execute("""
@@ -530,12 +562,12 @@ def analyze_stream():
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
-            # CORS (optional)
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type",
         }
         return Response(stream_with_context(generate()), headers=headers)
+
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500

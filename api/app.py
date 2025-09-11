@@ -17,7 +17,7 @@ if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing. Set it in .env or environment variables.")
 
 # ---------- Models ----------
-FULL_MODEL = os.getenv("FULL_MODEL", "gpt-5")
+FULL_MODEL = os.getenv("FULL_MODEL", "gpt-40")
 FAST_MODEL = os.getenv("FAST_MODEL", "gpt-4o-mini")  # keep FAST truly fast
 
 # ---------- Image handling dependencies ----------
@@ -510,22 +510,48 @@ def analyze_stream():
             except Exception as e:
                 yield f"event: warn\ndata:{json.dumps('Streaming error: ' + str(e))}\n\n"
 
-            # 2) Fallback if no tokens were emitted
+                       # 2) Fallback if no tokens were emitted
             if not emitted_any:
-                try:
-                    resp_full = full_client.chat.completions.create(
-                        model=FULL_MODEL,
-                        messages=messages,
-                        extra_body={"max_completion_tokens": 2200},
-                    )
-                    analysis = (resp_full.choices[0].message.content or "").strip()
-                    if analysis:
-                        full_text_parts.append(analysis)
-                        yield f"event: token\ndata:{json.dumps(analysis)}\n\n"
-                    else:
-                        yield f"event: warn\ndata:{json.dumps('Model returned empty text')}\n\n"
-                except Exception as e2:
-                    yield f"event: error\ndata:{json.dumps('Fallback error: ' + str(e2))}\n\n"
+                fallback_models = [FULL_MODEL, "gpt-4o", "gpt-4o-mini"]
+                analysis = ""
+                last_reason = None
+
+                for m in fallback_models:
+                    try:
+                        resp_full = full_client.chat.completions.create(
+                            model=m,
+                            messages=messages,
+                            # keep it boring to avoid filter surprises
+                            temperature=0.2,
+                            extra_body={"max_completion_tokens": 3200},
+                        )
+                        choice = resp_full.choices[0]
+                        last_reason = getattr(choice, "finish_reason", None)
+                        text = (choice.message.content or "").strip()
+
+                        # Surface what happened
+                        yield f"event: debug\ndata:{json.dumps({'model': m, 'finish_reason': last_reason})}\n\n"
+
+                        if text:
+                            analysis = text
+                            break
+
+                        # If content filter tripped or we got nothing, try next model
+                        if last_reason in ("content_filter", None) or text == "":
+                            continue
+
+                    except Exception as e2:
+                        yield f"event: warn\ndata:{json.dumps(f'Fallback call failed on {m}: {str(e2)[:160]}')}\n\n"
+                        continue
+
+                if analysis:
+                    yield f"event: token\ndata:{json.dumps(analysis)}\n\n"
+                else:
+                    msg = "All fallbacks returned empty text"
+                    if last_reason:
+                        msg += f" (finish_reason={last_reason})"
+                    yield f"event: error\ndata:{json.dumps(msg)}\n\n"
+
 
             # 3) Persist and finish
             analysis = "".join(full_text_parts).strip()

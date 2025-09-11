@@ -256,6 +256,126 @@ def _has_enough_sections(txt: str) -> bool:
     # require at least 8/10 H2 headers to be safe
     found = sum(1 for h in EXPECTED_H2 if h in txt)
     return found >= 8
+
+# ---------- Prompt builder (enforces the 10 H2 sections) ----------
+def build_prompt(note: str, specialty: str, images_meta_text: str, detected_conditions):
+    modifier = get_prompt_modifier(specialty) or ""
+    extra_guidance = ""
+    if detected_conditions:
+        extra_guidance = "\n".join(
+            f"### SPECIAL GUIDANCE: {cond.upper()}\n{GUIDANCE_DATA[cond]['prompt']}"
+            for cond in detected_conditions if cond in GUIDANCE_DATA
+        )
+
+    # The exact headers we expect the model to output
+    headings_block = "\n".join(EXPECTED_H2)
+
+    return f"""
+You are a clinical decision support AI. Return ONLY a Markdown report with the
+following H2 section headings EXACTLY as written below (no preface text, no appendices):
+
+{headings_block}
+
+Rules:
+- Use concise, guideline-aware language. Cite guideline names (no URLs).
+- Integrate imaging findings if images are present.
+- If a section is not applicable, include it with "N/A" and a brief reason.
+- Keep medication doses realistic and include monitoring considerations.
+
+Specialty modifier (may be empty):
+{modifier}
+
+{extra_guidance if extra_guidance else ''}
+
+CASE NOTE:
+{note}
+
+IMAGE METADATA:
+{images_meta_text if images_meta_text else 'No images attached.'}
+""".strip()
+
+
+# ---------- FAST triage (JSON) ----------
+def run_fast_analysis(note: str, specialty: str) -> str:
+    prompt = f"""
+Return JSON with these keys only:
+- differentials: top 3 (short phrases, ≤6 words)
+- initial_actions: up to 5 bullets (≤10 words each)
+- red_flags: up to 5 bullets (≤10 words each)
+
+Patient note:
+{note[:2000]}
+""".strip()
+
+    resp = fast_client.chat.completions.create(
+        model=FAST_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a concise clinical triage assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+        max_tokens=350,
+        response_format={"type": "json_object"},
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+# ---------- FULL analysis (rich 10-section write-up with repair) ----------
+def run_gpt5_analysis(note: str, specialty: str, images_data_uris: list, filenames_meta: list):
+    detected_conditions = detect_conditions(note)
+
+    prompt_text = build_prompt(
+        note=note,
+        specialty=specialty,
+        images_meta_text=", ".join(filenames_meta or []),
+        detected_conditions=detected_conditions,
+    )
+
+    # Compose vision content (text + optional images)
+    content_blocks = [{"type": "text", "text": prompt_text}]
+    for uri in images_data_uris or []:
+        content_blocks.append({"type": "image_url", "image_url": {"url": uri}})
+
+    # First attempt
+    resp = full_client.chat.completions.create(
+        model=FULL_MODEL,  # e.g., "gpt-5"
+        messages=[
+            {"role": "system", "content": "You are a medical expert that returns only a well-structured, comprehensive 10-section diagnostic analysis."},
+            {"role": "user", "content": content_blocks},
+        ],
+        temperature=0.2,
+        max_tokens=2800,   # give the model enough room
+    )
+    draft = (resp.choices[0].message.content or "").strip()
+
+    # If the model didn't include enough of the exact headers, ask it to repair
+    if not _has_enough_sections(draft):
+        repair_prompt = f"""
+Rewrite the following draft into EXACTLY these 10 H2 sections (no extra sections,
+no intro/outro text). Use the headings verbatim:
+
+{chr(10).join(EXPECTED_H2)}
+
+Draft to rewrite:
+{draft}
+""".strip()
+
+        resp2 = full_client.chat.completions.create(
+            model=FULL_MODEL,
+            messages=[
+                {"role": "system", "content": "Rewrite strictly into the exact 10 requested H2 sections. Do not add other sections."},
+                {"role": "user", "content": repair_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=2200,
+        )
+        final_text = (resp2.choices[0].message.content or "").strip()
+        if _has_enough_sections(final_text):
+            draft = final_text  # use repaired version
+
+    return draft, detected_conditions
+
+
 # ---------- Condition detector (used by full pass) ----------
 def detect_conditions(note: str):
     """

@@ -17,7 +17,7 @@ if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing. Set it in .env or environment variables.")
 
 # ---------- Models ----------
-FULL_MODEL = os.getenv("FULL_MODEL", "gpt-40")
+FULL_MODEL = os.getenv("FULL_MODEL", "gpt-4o")
 FAST_MODEL = os.getenv("FAST_MODEL", "gpt-4o-mini")  # keep FAST truly fast
 
 # ---------- Image handling dependencies ----------
